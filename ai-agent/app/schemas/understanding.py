@@ -58,4 +58,38 @@ class Clause(BaseModel):
     )
 
 
-__all__ = ["Clause"]
+class MetadataItem(BaseModel):
+    """一条从文档里抽出来的元数据。
+
+    边界（与 Backend 的分工）
+    ----------------------
+    这里抽的是**文档内容里写着的事实**，不是 Backend 上的合同业务字段。
+    合同编号 / 名称 / 类型 / 送审部门这些由用户在上传时声明，属 Backend 的主数据 ——
+    Agent 不从文档里再猜一遍（猜错会静默改变规则集的选择）。
+
+    位置契约（沿用 P6-2）
+    -------------------
+    ``paragraph_index`` + ``quote`` 回答"这个值是从哪句话读出来的"。
+    不引入字符偏移、不出现数据库主键。
+    """
+
+    field_key: str = Field(description="字段键，如 counterparty_name / contract_amount")
+    field_label: str = Field(description="展示名，来自提取器的字段目录（一处定义）")
+    field_value: str = Field(
+        description="字段值。**已规范化**：日期统一 YYYY-MM-DD、金额统一两位小数的纯数字串。"
+        "类型由 value_type 标明 —— 规范化让下游不必各自解析一遍"
+    )
+    value_type: str = Field(description="TEXT / AMOUNT / DATE / CODE")
+    paragraph_index: int = Field(description="来源段落序号。**块级字段**（如付款条件）指向该块的**第一段**")
+    quote: str = Field(
+        description="命中的原文片段 —— 人工核对与前端展示的依据。"
+        "绝大多数字段是单段文本；**块级字段可能跨连续多段**，"
+        "此时它按 \\n 拼接，行 i 对应段落 ``paragraph_index + i``"
+    )
+    extract_method: str = Field(
+        description="提取方式，取值见 ``app.core.constants.ExtractMethod``；"
+        "确定性抽取恒为 REGEX（Backend 侧标注该值用于元数据字段）"
+    )
+
+
+__all__ = ["Clause", "MetadataItem"]
