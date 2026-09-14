@@ -12,12 +12,59 @@
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
-| P1 | 架构设计 | ✅ 已完成（架构文档已确认） |
-| **P2-a** | **版本控制 / 依赖 / 目录骨架** | **✅ 已完成** |
-| P2-b | core 基座（config / constants / logging / errors） | ⏳ 进行中 |
-| P2-c | 数据库与 Alembic 初始化 | ⏸ 未开始 |
-| P2-d | 并发模型基座 + FastAPI 入口 + `/health` | ⏸ 未开始 |
-| P2-e | 前端空壳（Vite + Vue3 + Element Plus） | ⏸ 未开始 |
+| P1 | 架构设计 | ✅ PASS（架构文档已确认） |
+| P2-a | 版本控制 / 依赖 / 目录骨架 | ✅ PASS |
+| P2-b | core 基座（config / constants / logging / errors） | ✅ PASS |
+| P2-c | 数据库基础设施（async engine / session 生命周期 / Alembic / UTC 会话时区） | ✅ PASS |
+| P2-d | 并发基座 + FastAPI 入口 + lifespan + `/health` + 异常处理 | ✅ PASS |
+| P2-e | 前端基础壳工程（Vue3 + Vite + Element Plus + Router + Pinia + Axios） | ✅ PASS |
+| **P3** | **后端数据库建模（15 张业务表 + baseline 迁移 + 规则 seed）** | **✅ PASS** |
+
+> **当前状态：P3 已完成，工作区 clean，尚未进入 P4。**
+>
+> 尚未实现的业务：合同接入、文档解析、OCR、规则引擎、LLM 审查、任务 Worker、人工复核、审批回写、报告导出。
+
+---
+
+## 数据库（P3 完成）
+
+MySQL 8.4.8，库 `contract_approval`，字符集 `utf8mb4_0900_ai_ci`。ORM 为 SQLAlchemy 2.x（async），迁移由 Alembic 管理。
+
+**已建立 15 张业务表**（架构文档 §7.2 中字段定义完整者）：
+
+| 域 | 表 |
+|---|---|
+| 合同 | `contract`、`contract_file` |
+| 审查任务 | `review_task` |
+| 文档解析 | `document_block`、`contract_metadata`、`clause` |
+| 规则 | `review_rule_set`、`review_rule` |
+| 风险 | `risk_item`、`risk_suggestion` |
+| 回写与日志 | `writeback_record`、`ai_call_log` |
+| Mock 审批 | `approval_instance`、`approval_comment` |
+| 同步游标 | `sync_cursor` |
+
+**刻意未创建**（架构文档中无字段定义，留待对应阶段）：`sys_user`(P4)、`task_event`(P6)、`annotation`(P11)、`report`(P12)、`standard_clause`(P13)、`writeback_log`(P12)。
+
+**迁移**：baseline migration `313b0960b510`，位于 `backend/migrations/versions/`。以下命令均已实测通过（`upgrade` 建表 / `check` 与模型逐列一致 / `downgrade` 可逆）：
+
+```bash
+cd backend
+uv run alembic upgrade head
+uv run alembic check
+uv run alembic downgrade base
+```
+
+**Seed**：`uv run python scripts/seed_rules.py` 灌入采购合同规则集（幂等且收敛，重复执行不产生重复行）。
+
+| rule_code | 类型 | 等级 | 维度 |
+|---|---|---|---|
+| `IP_OWNER_SUPPLIER_001` | KEYWORD | HIGH | 知识产权 |
+| `LIAB_UNLIMITED_001` | KEYWORD | HIGH | 违约责任 |
+| `PAY_PREPAY_RATIO_001` | THRESHOLD | MEDIUM | 金额支付 |
+
+> `MISSING`（必备条款缺失）类规则的 `expression` 契约在架构文档中没有示例，故**暂缓到 P9** 定义后再增量补充，当前只 seed 上述 3 条契约明确的规则。
+
+**关键约定**：时间列一律 `DATETIME(3)` 存 naive UTC；金额一律 `DECIMAL(18,2)`（禁 float）；枚举字段存 VARCHAR（不用 MySQL 原生 ENUM）；外键一律无级联（RESTRICT）；数据库会话时区固定 `+00:00`。
 
 ---
 
@@ -78,7 +125,7 @@ contract_approval/
 │  ├─ scripts/              # 运维脚本（建库 / seed / 起 worker）
 │  ├─ tests/                # unit / integration / fixtures
 │  └─ storage/              # 运行时文件（已 gitignore）
-├─ frontend/                # Vue3 + Vite 前端（P2-e 起）
+├─ frontend/                # Vue3 + Vite 前端（P2-e 已完成基础壳工程）
 ├─ samples/                 # 示例合同
 ├─ docs/                    # 架构与阶段文档
 ├─ .env.example
@@ -89,3 +136,12 @@ contract_approval/
 
 - 数据库密码、API Key 等敏感信息**只存放在本机 `.env`**，不进入代码、日志或版本库。
 - `backend/storage/` 下的用户上传文件与渲染产物不进入版本库。
+
+## 提交记录
+
+| commit | 说明 |
+|---|---|
+| `1bb27db` | chore: initialize project and core infrastructure（P2-a / P2-b） |
+| `ddec63b` | add database and application infrastructure（P2-c / P2-d） |
+| `5c0f93a` | P2-e frontend shell（P2-e） |
+| `b586b22` | feat: add contract review database models（P3） |
