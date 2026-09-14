@@ -62,6 +62,28 @@ class RuleType(StrEnum):
     THRESHOLD = "THRESHOLD"  # 数值比较
 
 
+class LLMScene(StrEnum):
+    """LLM 调用场景（P9-1 引入）。
+
+    ⚠️ **必须与 ``backend/app/core/constants.py`` 的 ``LLMScene`` 保持一致** ——
+    它是第 4 个跨服务枚举副本（前三个：``ClauseType`` / ``ExtractMethod`` / ``RuleType``），
+    同步代价与兜底方式同 ``ClauseType``（见本模块 docstring）。
+
+    为什么这里用**枚举**而不是 ``str``（``AgentRule.rule_type`` 用的是 ``str``）
+    ----------------------------------------------------------------------
+    判据是"值从哪来"：``rule_type`` 由 **Backend 的规则目录**配置，收成枚举会让一个
+    配错的值在加载阶段炸掉整份规则集；而 ``scene`` 是 **Agent 自己**在调用点写死的
+    —— 它是 Agent 内部的选择，没有外部数据源会传来意外的值。此时枚举是纯收益：
+    拼错 ``"CLAUSE_REVIEW"`` 这类错误会在**写代码时**就被拦住，而不是在
+    ``ai_call_log`` 里留下一个永远归不了类的字符串。
+    """
+
+    CLAUSE_REVIEW = "CLAUSE_REVIEW"  # 条款合规审查（核心）
+    METADATA_EXTRACT = "METADATA_EXTRACT"  # 元数据抽取兜底
+    SUGGESTION = "SUGGESTION"  # 修改建议生成
+    SUMMARY = "SUMMARY"  # 审查摘要生成
+
+
 class ExtractMethod(StrEnum):
     """提取/切分方式。
 
@@ -78,4 +100,4 @@ class ExtractMethod(StrEnum):
     MANUAL = "MANUAL"  # 人工录入 / 修正
 
 
-__all__ = ["ClauseType", "ExtractMethod", "RuleType"]
+__all__ = ["ClauseType", "ExtractMethod", "LLMScene", "RuleType"]

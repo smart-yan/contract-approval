@@ -7,8 +7,9 @@ Agent **不访问数据库**，因此这里**没有**任何 MySQL / 连接池配
 
 DeepSeek 配置说明
 ----------------
-``DEEPSEEK_*`` 三项是**配置骨架**：P5 阶段只读取与展示（``/health`` 里报告
-"是否已配置"），**不会发起任何 LLM 请求**。真正的 Provider 实现属于 P10。
+``DEEPSEEK_*`` 三项供 :class:`~app.llm.provider.DeepSeekProvider` 使用（P9-1 起）。
+``/health`` 只报告"是否已配置"（``llm_configured``），**不回显密钥**；
+未配置时 Provider 在本地短路，不会发出任何请求。
 
 密钥用 ``SecretStr`` 承载，``repr()`` 与日志里恒为 ``**********``。
 """

@@ -44,5 +44,11 @@ class AgentErrorCode(StrEnum):
     #: 文件无法被解析：损坏 / 不是合法的 DOCX / 本地读不到
     PARSE_FAILED = "PARSE_FAILED"
 
+    #: LLM 无法调用：未配置 / 连不上 / 超时 / 非 2xx（P9-1）
+    LLM_UNAVAILABLE = "LLM_UNAVAILABLE"
+
+    #: LLM 的输出不是合法 JSON，或不满足请求里声明的 schema（P9-1）
+    LLM_SCHEMA_INVALID = "LLM_SCHEMA_INVALID"
+
 
 __all__ = ["AgentErrorCode"]
