@@ -23,8 +23,10 @@ class ReviewRunResponse(BaseModel):
     """一次合同审查编排的结果（Graph 结束时的状态投影）。"""
 
     workflow_status: Literal["completed", "rejected"] = Field(
-        description="completed = 走完 upload → validate → parse；"
-        "rejected = 在 validate 处被 Conditional Edge 拦下，未进入解析"
+        description="本工作流是否产出了**可用的文档**。"
+        "completed = 上传通过且解析拿到了可用文档（PARSED 或 EMPTY）；"
+        "rejected = 三种情况之一：被 validate 门禁拦下、解析失败、或解析根本没跑过。"
+        "具体原因看 error_code —— status 只回答'有没有结果'，不回答'为什么没有'"
     )
 
     # ---- 来自 Backend 的标识（失败时可能为空）----

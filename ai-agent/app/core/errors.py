@@ -38,5 +38,11 @@ class AgentErrorCode(StrEnum):
     #: Backend 返回 2xx，但响应体缺少继续 Workflow 所必需的字段
     BACKEND_CONTRACT_INCOMPLETE = "BACKEND_CONTRACT_INCOMPLETE"
 
+    #: 没有能处理该文件类型的 Parser（P6 起只支持 DOCX）
+    PARSE_UNSUPPORTED_TYPE = "PARSE_UNSUPPORTED_TYPE"
+
+    #: 文件无法被解析：损坏 / 不是合法的 DOCX / 本地读不到
+    PARSE_FAILED = "PARSE_FAILED"
+
 
 __all__ = ["AgentErrorCode"]

@@ -6,9 +6,15 @@
 
 from __future__ import annotations
 
-from app.graph.edges.routing import route_after_validate
+import pytest
+
+from app.graph.edges.routing import route_after_parse, route_after_validate
+from app.schemas.document import ParseResult
 
 
+# --------------------------------------------------------------------------- #
+# validate_file 之后
+# --------------------------------------------------------------------------- #
 def test_routes_to_continue_when_file_valid() -> None:
     assert route_after_validate({"file_valid": True}) == "continue"
 
@@ -25,3 +31,32 @@ def test_routes_to_stop_when_flag_missing() -> None:
 def test_routes_to_stop_when_flag_is_not_true() -> None:
     """只有**严格等于 True** 才继续，避免"真值"被误当成校验通过。"""
     assert route_after_validate({"file_valid": False, "validation_errors": ["x"]}) == "stop"
+
+
+# --------------------------------------------------------------------------- #
+# parse_document 之后
+# --------------------------------------------------------------------------- #
+def _parsed(status: str) -> ParseResult:
+    return ParseResult(status=status, parser="DocxParser", source_file_type="DOCX")
+
+
+@pytest.mark.parametrize("status", ["PARSED", "EMPTY"])
+def test_parse_continues_on_usable_document(status: str) -> None:
+    assert route_after_parse({"parse_result": _parsed(status)}) == "continue"
+
+
+def test_parse_stops_when_parsing_failed() -> None:
+    """核心不变量：解析失败就必须结束工作流，不能让后续节点拿到一份空文档往下跑。"""
+    state = {
+        "file_valid": True,
+        "error_code": "PARSE_FAILED",
+        "parse_result": _parsed("FAILED"),
+    }
+
+    assert route_after_parse(state) == "stop"
+
+
+def test_parse_stops_when_result_missing() -> None:
+    """fail-closed：没跑过解析（或键名写错）时不能默认往下走。"""
+    assert route_after_parse({}) == "stop"
+    assert route_after_parse({"parse_result": None}) == "stop"

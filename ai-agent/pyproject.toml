@@ -12,6 +12,7 @@ dependencies = [
     "langchain-core>=1.6.3",
     "langgraph>=1.2.11",
     "pydantic-settings>=2.15.0",
+    "python-docx>=1.1",
     "python-multipart>=0.0.32",
     "uvicorn[standard]>=0.52.4",
 ]

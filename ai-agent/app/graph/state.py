@@ -70,4 +70,21 @@ class ContractReviewState(TypedDict, total=False):
     error_message: str | None
 
 
-__all__ = ["ContractReviewState"]
+def has_usable_document(state: ContractReviewState) -> bool:
+    """State 里是否拿到了**可用的文档**。
+
+    这是"解析这一步算不算成功"的**唯一判据**，Graph 的分流与对外响应都读它，
+    不允许在别处再写一遍 ``status == "FAILED"``。
+
+    可用的定义
+    ---------
+    * ``PARSED`` —— 解析出内容了
+    * ``EMPTY``  —— 解析成功，但文档本身没内容（**数据问题**，不是我们没读出来）
+    * ``parse_result`` 缺失 —— **不可用**（fail-closed：没跑过解析就不能当成拿到了文档）
+    * ``FAILED`` —— 不可用（**系统问题**，需要人工或重试介入）
+    """
+    result = state.get("parse_result")
+    return result is not None and result.status != "FAILED"
+
+
+__all__ = ["ContractReviewState", "has_usable_document"]

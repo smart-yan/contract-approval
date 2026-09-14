@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient
 import app.api.review as review_module
 from app.main import app
 from app.tools.backend_client import BackendClient
+from tests.factories import docx_bytes
 
 BACKEND_BASE_URL = "http://backend.test"
 EXPECTED_UPLOAD_URL = f"{BACKEND_BASE_URL}/api/v1/contracts"
@@ -48,8 +49,9 @@ SUCCESS_PAYLOAD: dict[str, Any] = {
     "task_reused": False,
 }
 
-#: 合法 DOCX 魔数（ZIP 头）—— Backend 侧才校验，这里只保证是一个可传输的字节流
-DOCX_BYTES = b"PK\x03\x04 minimal docx fixture"
+#: 一份**真实**的 DOCX（P6-1 起 parse_document 会真的去解析它）
+DOCX_PARAGRAPHS = ("甲方：某某科技有限公司", "第一条 本合同自双方签字之日起生效。")
+DOCX_BYTES = docx_bytes(*DOCX_PARAGRAPHS)
 
 Handler = Callable[[httpx.Request], Coroutine[Any, Any, httpx.Response]]
 
@@ -148,11 +150,62 @@ def test_valid_file_runs_the_whole_workflow(agent: Callable[[Handler], TestClien
     assert body["reused"] is False
     assert body["task_reused"] is False
 
-    # 3) 解析节点执行了，但只产出桩结果
-    assert body["parse_result"]["status"] == "STUB"
+    # 3) 解析节点真的解析了 DOCX（P6-1 起不再是桩）
+    assert body["parse_result"]["status"] == "PARSED"
+    assert body["parse_result"]["parser"] == "DocxParser"
     assert body["parse_result"]["source_file_type"] == "DOCX"
-    assert body["parse_result"]["text"] == ""
+    assert [p["text"] for p in body["parse_result"]["paragraphs"]] == list(DOCX_PARAGRAPHS)
+    assert body["parse_result"]["text"] == "\n".join(DOCX_PARAGRAPHS)
     assert body["validation_errors"] == []
+    assert body["error_code"] is None
+
+
+# --------------------------------------------------------------------------- #
+# 解析失败 / 空文档 —— workflow_status 必须与 parse_result 一致
+# --------------------------------------------------------------------------- #
+def test_unparsable_document_is_never_reported_as_completed(
+    agent: Callable[[Handler], TestClient],
+) -> None:
+    """核心不变量：``parse_result.status == "FAILED"`` ⇒ ``workflow_status != "completed"``。
+
+    这份文件上传能过（Backend 认它是 DOCX），但内容不是合法的 ZIP ——
+    解析读不出来。工作流**没有**产出任何可用内容，就不能说它完成了。
+    """
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(201, json=SUCCESS_PAYLOAD)
+
+    response = _post(agent(handler), payload=b"this is not a zip archive at all")
+
+    assert response.status_code == 422, "没产出可用文档就不该是 2xx"
+    body = response.json()
+
+    assert body["parse_result"]["status"] == "FAILED"
+    assert body["workflow_status"] != "completed"
+    assert body["workflow_status"] == "rejected"
+    assert body["error_code"] == "PARSE_FAILED"
+    assert body["parse_result"]["error_code"] == "PARSE_FAILED"
+    assert body["parse_result"]["paragraphs"] == []
+    # 上传本身是成功的 —— 失败发生在解析，不要把它误报成上传问题
+    assert body["contract_id"] == 11
+    assert body["validation_errors"] == []
+
+
+def test_empty_document_is_completed_not_rejected(
+    agent: Callable[[Handler], TestClient],
+) -> None:
+    """空文档是**数据问题**（合同本身没内容），解析是成功的，不能说工作流失败。"""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(201, json=SUCCESS_PAYLOAD)
+
+    response = _post(agent(handler), payload=docx_bytes())
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["workflow_status"] == "completed"
+    assert body["parse_result"]["status"] == "EMPTY"
+    assert body["parse_result"]["text"] == ""
     assert body["error_code"] is None
 
 

@@ -1,7 +1,7 @@
 """最小合同审查 Graph 的装配。
 
-P5-3 的图（刻意只有这些）
-------------------------
+当前的图
+-------
 ::
 
     START
@@ -12,18 +12,26 @@ P5-3 的图（刻意只有这些）
       ▼
     validate_file
       │
-      ├── conditional edge ── invalid ──▶ END
+      ├── 条件边 ── invalid ──▶ END
       │
      valid
       ▼
     parse_document
       │
+      ├── 条件边 ── FAILED ──▶ END
+      │
+     PARSED / EMPTY
       ▼
-    END
+    END（P7 起这里会接上 identify_clauses）
 
-P5-3 **不包含**：clauses / metadata / keywords / risks / suggestions / report /
-LLM / Prompt / Tool Calling / checkpoint / interrupt / 人工审核 / 数据库写入。
-这些属于 P5-4 之后的阶段。
+⚠️ 两条分支今天都指向 ``END`` —— 因为 ``parse_document`` 之后还没有别的节点。
+这**不是冗余**：它把"解析失败就不该往下走"这个决定放在图的结构里，
+P7 接入第一个节点时只需要把 ``continue`` 指向它，``stop`` 保持不动即可。
+如果改成直连 ``END``，那个决定就会退回成"DTO 在响应里补一句"，
+后续节点照样会拿到空文档继续跑。
+
+**不包含**：clauses / metadata / keywords / risks / suggestions / report /
+LLM / Prompt / checkpoint / interrupt / 人工审核 / 数据库写入。
 
 LangGraph 版本说明
 -----------------
@@ -45,7 +53,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
 from app.graph.context import ReviewContext
-from app.graph.edges.routing import route_after_validate
+from app.graph.edges.routing import route_after_parse, route_after_validate
 from app.graph.nodes.parse_document import parse_document
 from app.graph.nodes.upload_file import upload_file
 from app.graph.nodes.validate_file import validate_file
@@ -61,6 +69,14 @@ NODE_PARSE_DOCUMENT = "parse_document"
 #: 分支名 → 真实目标（``END`` 是 langgraph 的结束哨兵，不是普通节点）
 CONDITIONAL_ROUTES: dict[str, str] = {
     "continue": NODE_PARSE_DOCUMENT,
+    "stop": END,
+}
+
+#: 解析之后的分支表。
+#: 今天两个分支都落在 ``END``（后面还没有节点）；P7 接入条款识别时，
+#: 把 ``continue`` 改指到那个节点即可 —— 这正是保留这条边的意义。
+PARSE_ROUTES: dict[str, str] = {
+    "continue": END,
     "stop": END,
 }
 
@@ -85,8 +101,12 @@ def build_review_graph() -> CompiledStateGraph:
         CONDITIONAL_ROUTES,
     )
 
-    # ---- 收尾 ----
-    graph.add_edge(NODE_PARSE_DOCUMENT, END)
+    # ---- 分支：parse_document 之后由 State 决定继续还是结束 ----
+    graph.add_conditional_edges(
+        NODE_PARSE_DOCUMENT,
+        route_after_parse,
+        PARSE_ROUTES,
+    )
 
     return graph.compile()
 
@@ -96,5 +116,6 @@ __all__ = [
     "NODE_PARSE_DOCUMENT",
     "NODE_UPLOAD_FILE",
     "NODE_VALIDATE_FILE",
+    "PARSE_ROUTES",
     "build_review_graph",
 ]

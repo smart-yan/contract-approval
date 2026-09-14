@@ -25,9 +25,11 @@ from typing import Any
 import httpx
 import pytest
 
+from app.core.errors import AgentErrorCode
 from app.graph.builder import build_review_graph
 from app.graph.context import ReviewContext
 from app.tools.backend_client import BackendClient
+from tests.factories import docx_bytes
 
 BACKEND_BASE_URL = "http://backend.test"
 EXPECTED_UPLOAD_URL = f"{BACKEND_BASE_URL}/api/v1/contracts"
@@ -40,9 +42,9 @@ SUCCESS_PAYLOAD: dict[str, Any] = {
     "contract_type": "PURCHASE",
     "contract_status": "PENDING",
     "file_id": 22,
-    "filename": "contract.pdf",
+    "filename": "contract.docx",
     "file_size": 1234,
-    "file_type": "PDF",
+    "file_type": "DOCX",
     "sha256": "a" * 64,
     "parse_status": "PENDING",
     "review_task_id": 33,
@@ -51,8 +53,9 @@ SUCCESS_PAYLOAD: dict[str, Any] = {
     "reused": False,
 }
 
-#: 合法的 PDF 头，保证"上传的确实是 Agent 拿到的那个文件"
-PDF_BYTES = b"%PDF-1.7\n% minimal fixture\n"
+#: 一份**真实**的 DOCX（P6-1 起 parse_document 会真的去解析它）
+DOCX_PARAGRAPHS = ("甲方：某某科技有限公司", "第一条 本合同自双方签字之日起生效。")
+DOCX_BYTES = docx_bytes(*DOCX_PARAGRAPHS)
 
 Handler = Callable[[httpx.Request], Coroutine[Any, Any, httpx.Response]]
 
@@ -80,16 +83,16 @@ async def make_backend() -> AsyncIterator[Callable[[Handler], BackendClient]]:
 
 @pytest.fixture
 def source_file(tmp_path: Path) -> Path:
-    path = tmp_path / "contract.pdf"
-    path.write_bytes(PDF_BYTES)
+    path = tmp_path / "contract.docx"
+    path.write_bytes(DOCX_BYTES)
     return path
 
 
 def _initial_state(source_file: Path) -> dict[str, Any]:
     return {
         "file_path": str(source_file),
-        "filename": "contract.pdf",
-        "content_type": "application/pdf",
+        "filename": "contract.docx",
+        "content_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "contract_no": "HT-2026-001",
         "title": "设备采购合同",
         "contract_type": "PURCHASE",
@@ -129,7 +132,7 @@ async def test_valid_file_runs_through_to_parse(
     assert b'name="contract_no"' in bodies[0]
     assert b"HT-2026-001" in bodies[0]
     assert b'name="contract_type"' in bodies[0]
-    assert PDF_BYTES in bodies[0]
+    assert DOCX_BYTES in bodies[0]
 
     # 2) Backend 返回的标识被带进了 State
     assert final["contract_id"] == 11
@@ -143,11 +146,36 @@ async def test_valid_file_runs_through_to_parse(
     assert final["validation_errors"] == []
     assert final.get("error_code") is None
 
-    # 4) 解析节点执行了，但只产出桩结果 —— 不伪造合同正文
+    # 4) 解析节点真的把 DOCX 解析成了结构化文档（P6-1 起不再是桩）
     parse_result = final["parse_result"]
-    assert parse_result.status == "STUB"
-    assert parse_result.source_file_type == "PDF"
-    assert parse_result.text == ""
+    assert parse_result.status == "PARSED"
+    assert parse_result.parser == "DocxParser"
+    assert parse_result.source_file_type == "DOCX"
+    assert [p.text for p in parse_result.paragraphs] == list(DOCX_PARAGRAPHS)
+    assert parse_result.text == "\n".join(DOCX_PARAGRAPHS)
+
+
+# --------------------------------------------------------------------------- #
+# Case 1b：可上传但解析不出来 —— 图必须经由 parse 后的条件边收尾
+# --------------------------------------------------------------------------- #
+async def test_unparsable_document_ends_the_workflow_after_parse(
+    make_backend: Callable[[Handler], BackendClient], tmp_path: Path
+) -> None:
+    """内容不是合法 DOCX：解析失败，工作流在 parse 之后的条件边处结束。"""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(201, json=SUCCESS_PAYLOAD)
+
+    broken = tmp_path / "broken.docx"
+    broken.write_bytes(b"not a zip archive")
+
+    final = await _run(make_backend(handler), broken)
+
+    assert final["file_valid"] is True, "门禁过了 —— 问题出在解析，不是上传"
+    assert final["parse_result"].status == "FAILED"
+    assert final["parse_result"].parser == "DocxParser"
+    assert final["error_code"] == AgentErrorCode.PARSE_FAILED.value
+    assert final["parse_result"].paragraphs == []
 
 
 # --------------------------------------------------------------------------- #

@@ -17,11 +17,16 @@ Frontend 把文件交给 Agent，Agent 再转交给 Backend。中间这一跳必
 工作流结束后无论成败都在 ``finally`` 里删除 —— **这不是 Backend 那套孤儿清理的一部分**，
 只是一个请求内的临时文件生命周期。
 
-关于 422
--------
-工作流被 Gate 拦下时返回 422，具体原因在 ``error_code`` 里（取值见 ``AgentErrorCode``）。
-更细的状态码映射（例如把 ``BACKEND_UNREACHABLE`` 映射成 502）属于 P6 的 ErrorClassifier，
-P5-4 刻意不做。
+关于状态码
+---------
+``200`` ⇔ 工作流**产出了可用文档**；其余一律 ``422``，具体原因在 ``error_code`` 里
+（取值见 ``AgentErrorCode``）。422 覆盖三种情况：被门禁拦下、解析失败、解析没跑过。
+
+状态码由 ``workflow_status`` 直接推导，**不单独判断** —— 否则会出现
+"上传成功但文档读不出来"被报成 200 的语义矛盾。
+
+更细的状态码映射（例如把 ``BACKEND_UNREACHABLE`` 映射成 502）属于后续的
+ErrorClassifier，当前刻意不做。
 """
 
 from __future__ import annotations
@@ -35,7 +40,7 @@ from typing import Annotated
 from fastapi import APIRouter, File, Form, Request, Response, UploadFile, status
 
 from app.graph.context import ReviewContext
-from app.graph.state import ContractReviewState
+from app.graph.state import ContractReviewState, has_usable_document
 from app.schemas.review import ReviewRunResponse
 from app.tools.backend_client import BackendClient
 
@@ -68,10 +73,16 @@ def _to_response(state: ContractReviewState) -> ReviewRunResponse:
 
     Graph 的 State 是 Agent 内部的工作记忆，不直接对外暴露 ——
     它可能包含后续阶段才会增加的字段，且字段名会随内部实现变化。
+
+    ``workflow_status`` 的判据
+    ------------------------
+    **必须同时看门禁与解析**：只看 ``file_valid`` 会让"上传成功但文档读不出来"
+    被报成 ``completed`` —— 明明没产出任何可用内容，却说工作流完成了。
+    两个条件都成立才算 ``completed``，否则一律 ``rejected``（具体原因在 ``error_code``）。
     """
-    completed = state.get("file_valid") is True
+    succeeded = state.get("file_valid") is True and has_usable_document(state)
     return ReviewRunResponse(
-        workflow_status="completed" if completed else "rejected",
+        workflow_status="completed" if succeeded else "rejected",
         contract_id=state.get("contract_id"),
         file_id=state.get("file_id"),
         review_task_id=state.get("review_task_id"),
@@ -91,8 +102,8 @@ def _to_response(state: ContractReviewState) -> ReviewRunResponse:
     response_model=ReviewRunResponse,
     summary="对一份合同文件执行 AI 审查编排",
     responses={
-        200: {"description": "工作流走完全程"},
-        422: {"description": "工作流在该文件上被拦下，具体原因见 error_code"},
+        200: {"description": "工作流产出了可用文档（workflow_status = completed）"},
+        422: {"description": "工作流没能产出可用文档，具体原因见 error_code"},
     },
 )
 async def run_review(
@@ -131,12 +142,16 @@ async def run_review(
     finally:
         await asyncio.to_thread(temp_path.unlink, True)
 
-    if final_state.get("file_valid") is not True:
-        # 工作流被拦下：不是服务出错，而是这份输入没能通过 Gate。
-        # 具体原因在响应体的 error_code / validation_errors 里。
+    body = _to_response(final_state)
+
+    if body.workflow_status != "completed":
+        # 工作流没能产出可用文档：不是服务出错，而是这份输入的结果不可用
+        # （被门禁拦下 / 解析失败 / 解析没跑过）。
+        # 状态码从**响应体**推导，保证两者永远一致 —— 不再单独判断 file_valid，
+        # 否则"上传成功但文档读不出来"会变成 200 + rejected 这种自相矛盾的返回。
         response.status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
 
-    return _to_response(final_state)
+    return body
 
 
 __all__ = ["UPLOAD_CHUNK_SIZE", "router", "run_review"]
