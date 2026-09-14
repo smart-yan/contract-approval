@@ -84,8 +84,12 @@ def test_only_approved_business_routes_are_mounted(app: FastAPI) -> None:
     "**只允许已批准的路由出现**"，而不是删掉测试。
 
     新增业务端点时**必须同步修改此白名单**：这样"未经裁决就加路由"会直接在 CI 暴露。
+
+    白名单演进：
+    * P4    ``/api/v1/contracts``  —— 合同接入
+    * P8-0  ``/api/v1/rule-sets``  —— 规则读取（只读，给 Agent 取规则用）
     """
-    approved = {"/api/v1/contracts"}
+    approved = {"/api/v1/contracts", "/api/v1/rule-sets"}
 
     paths = set(app.openapi()["paths"])
     mounted = {path for path in paths if path.startswith("/api/v1")}

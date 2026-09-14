@@ -4,16 +4,18 @@ main.py 只挂载这一个 router，业务端点按资源分文件加在 ``endpo
 新增资源时在此处 include 一行即可。
 
 ⚠️ 加新路由前请确认它属于**当前已批准的阶段** ——
-P4 只批准了合同接入（``POST /api/v1/contracts``）。
+P4 批准了合同接入（``POST /api/v1/contracts``），
+P8-0 批准了规则读取（``GET /api/v1/rule-sets``）。
 """
 
 from __future__ import annotations
 
 from fastapi import APIRouter
 
-from app.api.v1.endpoints import contracts
+from app.api.v1.endpoints import contracts, rule_sets
 
 api_v1_router = APIRouter()
 api_v1_router.include_router(contracts.router)
+api_v1_router.include_router(rule_sets.router)
 
 __all__ = ["api_v1_router"]
