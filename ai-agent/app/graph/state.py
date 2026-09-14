@@ -32,6 +32,7 @@ from __future__ import annotations
 from typing import TypedDict
 
 from app.schemas.document import ParseResult
+from app.schemas.understanding import Clause
 
 
 class ContractReviewState(TypedDict, total=False):
@@ -64,6 +65,9 @@ class ContractReviewState(TypedDict, total=False):
 
     # ------------------------------- parse ------------------------------ #
     parse_result: ParseResult | None
+
+    # --------------------------- understanding -------------------------- #
+    clauses: list[Clause]  # identify_clauses：条款切分结果
 
     # ------------------------------ failure ----------------------------- #
     error_code: str | None

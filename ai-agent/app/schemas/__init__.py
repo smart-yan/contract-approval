@@ -2,5 +2,6 @@
 
 from app.schemas.document import Paragraph, ParseResult
 from app.schemas.review import ReviewRunResponse
+from app.schemas.understanding import Clause
 
-__all__ = ["Paragraph", "ParseResult", "ReviewRunResponse"]
+__all__ = ["Clause", "Paragraph", "ParseResult", "ReviewRunResponse"]

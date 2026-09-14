@@ -22,15 +22,17 @@
       │
      PARSED / EMPTY
       ▼
-    END（P7 起这里会接上 identify_clauses）
+    identify_clauses
+      │
+      ▼
+    END（P8 起这里会接上 rule_review）
 
-⚠️ 两条分支今天都指向 ``END`` —— 因为 ``parse_document`` 之后还没有别的节点。
-这**不是冗余**：它把"解析失败就不该往下走"这个决定放在图的结构里，
-P7 接入第一个节点时只需要把 ``continue`` 指向它，``stop`` 保持不动即可。
-如果改成直连 ``END``，那个决定就会退回成"DTO 在响应里补一句"，
-后续节点照样会拿到空文档继续跑。
+⚠️ **解析后的条件边不是冗余**：它把"解析失败就不该往下走"放在图的结构里。
+P7-1 接入第一个理解层节点时，只需要把 ``continue`` 指向 ``identify_clauses``，
+``stop`` 保持不动 —— 这正是当初保留那条边的意义。
+如果当初直连 ``END``，这里就得重新想一遍"失败该怎么办"。
 
-**不包含**：clauses / metadata / keywords / risks / suggestions / report /
+**不包含**：metadata / keywords / risks / suggestions / report /
 LLM / Prompt / checkpoint / interrupt / 人工审核 / 数据库写入。
 
 LangGraph 版本说明
@@ -54,6 +56,7 @@ from langgraph.graph.state import CompiledStateGraph
 
 from app.graph.context import ReviewContext
 from app.graph.edges.routing import route_after_parse, route_after_validate
+from app.graph.nodes.identify_clauses import identify_clauses
 from app.graph.nodes.parse_document import parse_document
 from app.graph.nodes.upload_file import upload_file
 from app.graph.nodes.validate_file import validate_file
@@ -64,6 +67,7 @@ from app.graph.state import ContractReviewState
 NODE_UPLOAD_FILE = "upload_file"
 NODE_VALIDATE_FILE = "validate_file"
 NODE_PARSE_DOCUMENT = "parse_document"
+NODE_IDENTIFY_CLAUSES = "identify_clauses"
 
 # -------------------------- Conditional Edge -------------------------- #
 #: 分支名 → 真实目标（``END`` 是 langgraph 的结束哨兵，不是普通节点）
@@ -73,10 +77,10 @@ CONDITIONAL_ROUTES: dict[str, str] = {
 }
 
 #: 解析之后的分支表。
-#: 今天两个分支都落在 ``END``（后面还没有节点）；P7 接入条款识别时，
-#: 把 ``continue`` 改指到那个节点即可 —— 这正是保留这条边的意义。
+#: ``continue`` 指向第一个理解层节点；解析失败走 ``stop`` 直接收尾 ——
+#: 否则条款识别会拿到一份空文档，把"我们没读出来"当成"合同里没写"。
 PARSE_ROUTES: dict[str, str] = {
-    "continue": END,
+    "continue": NODE_IDENTIFY_CLAUSES,
     "stop": END,
 }
 
@@ -89,6 +93,7 @@ def build_review_graph() -> CompiledStateGraph:
     graph.add_node(NODE_UPLOAD_FILE, upload_file)
     graph.add_node(NODE_VALIDATE_FILE, validate_file)
     graph.add_node(NODE_PARSE_DOCUMENT, parse_document)
+    graph.add_node(NODE_IDENTIFY_CLAUSES, identify_clauses)
 
     # ---- 主干 ----
     graph.add_edge(START, NODE_UPLOAD_FILE)
@@ -108,11 +113,15 @@ def build_review_graph() -> CompiledStateGraph:
         PARSE_ROUTES,
     )
 
+    # ---- 收尾 ----
+    graph.add_edge(NODE_IDENTIFY_CLAUSES, END)
+
     return graph.compile()
 
 
 __all__ = [
     "CONDITIONAL_ROUTES",
+    "NODE_IDENTIFY_CLAUSES",
     "NODE_PARSE_DOCUMENT",
     "NODE_UPLOAD_FILE",
     "NODE_VALIDATE_FILE",

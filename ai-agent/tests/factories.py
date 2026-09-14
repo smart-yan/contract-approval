@@ -12,6 +12,9 @@ from pathlib import Path
 
 import docx
 
+from app.parsers.docx_parser import normalize_text
+from app.schemas.document import Paragraph, ParseResult
+
 #: 一个 block 可以是：
 #:   ``str``             → 一个普通段落
 #:   ``tuple[str, ...]`` → **一个段落**，各部分之间是作者插入的软换行（``<w:br/>``）
@@ -74,4 +77,55 @@ def _add_table(document: docx.Document, rows: Iterable[Iterable[str]]) -> None:
             table.cell(r, c).text = cell_text
 
 
-__all__ = ["Block", "docx_bytes", "save_docx", "soft_break_paragraph"]
+# --------------------------------------------------------------------------- #
+# 直接构造 ParseResult（不经过 DOCX）
+#
+# 理解层的纯函数测试不需要走真实的 DOCX 编解码 —— 直接给出段落序列，
+# 又快又能把"输入是什么"写得一目了然。序号由 make_parse_result 统一分配，
+# 避免手写下标写错。
+# --------------------------------------------------------------------------- #
+def para(text: str) -> Paragraph:
+    """一个正文段落（``PARAGRAPH``）。
+
+    ⚠️ 文本会经过与真实解析器**同一套**清洗（``normalize_text``）。
+    这不是多此一举：``ParseResult`` 的契约规定段落文本已压成单行，
+    工厂若放行 ``"   "`` 这类原文，就会造出**生产环境不可能出现**的输入，
+    让测试断言到不存在的行为。
+    """
+    return Paragraph(index=-1, block_type="PARAGRAPH", text=normalize_text(text))
+
+
+def row(*cells: str) -> Paragraph:
+    """一个表格行（``TABLE_ROW``），单元格各自清洗后用制表符连接 —— 与解析器一致。"""
+    return Paragraph(
+        index=-1,
+        block_type="TABLE_ROW",
+        text="\t".join(normalize_text(cell) for cell in cells),
+    )
+
+
+def make_parse_result(*blocks: Paragraph) -> ParseResult:
+    """把若干段落编成一个 ``ParseResult``，序号按顺序重排。
+
+    ``status`` / ``text`` 的算法与真实解析器一致 —— 测试夹具不引入第二套规则。
+    """
+    paragraphs = [b.model_copy(update={"index": i}) for i, b in enumerate(blocks)]
+    text = "\n".join(p.text for p in paragraphs)
+    return ParseResult(
+        status="PARSED" if text.strip() else "EMPTY",
+        parser="DocxParser",
+        source_file_type="DOCX",
+        text=text,
+        paragraphs=paragraphs,
+    )
+
+
+__all__ = [
+    "Block",
+    "docx_bytes",
+    "make_parse_result",
+    "para",
+    "row",
+    "save_docx",
+    "soft_break_paragraph",
+]
