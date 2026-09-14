@@ -200,9 +200,9 @@ async def test_graph_actually_evaluates_every_rule(
     calls: list[tuple[str, list[Any]]] = []
     real_evaluate = _RULE_REVIEW_MODULE.evaluate_rule
 
-    def spy(rule: Any, clauses: list[Any]) -> Any:
+    def spy(rule: Any, clauses: list[Any], metadata: Any = ()) -> Any:
         calls.append((rule.rule_code, clauses))
-        return real_evaluate(rule, clauses)
+        return real_evaluate(rule, clauses, metadata=metadata)
 
     monkeypatch.setattr(_RULE_REVIEW_MODULE, "evaluate_rule", spy)
 

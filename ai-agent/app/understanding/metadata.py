@@ -37,6 +37,7 @@
 ``effective_date``      ``生效日期：<日期>`` 或 ``自<日期>起生效``（日期必须**紧邻**标签）
 ``expire_date``         ``有效期至<日期>`` / ``到期日：<日期>``
 ``payment_terms``       第一处含 ``%`` / ``百分之`` 的**内容块**（表格块或单段落）
+``prepay_ratio``        **表格行**里「标签含预付款 + 同行有百分比」的第一处，规范化为比例
 ======================  ==========================================================
 
 两条刻意的保守选择
@@ -46,6 +47,11 @@
    宁可抽不到，也不能填错 —— 这是法务场景，错值比缺值危险。
 2. **信用代码必须带标签**。18 位纯数字在正文里并不罕见（编号、流水号），
    不锚定标签就有误识别风险。
+3. **``prepay_ratio`` 只认表格行**。付款计划表里「预付款 | 30%」是**结构化事实**：
+   标签与比例在同一行的固定位置上，读出来不需要理解语义。而「预付三成」
+   「预付一部分」要先理解自然语言 —— 那属于 **P9 的 LLM 阶段，这里刻意不做**：
+   猜错会直接改变一条 MEDIUM 风险的判定，而抽不到只是少一个字段（规则侧会停在
+   ``MISSING_INPUT``，不会被误判成"没超标"）。
 
 已知缺口（v1 明确不做，记录在案）
 ------------------------------
@@ -54,8 +60,9 @@
   ``contract_amount`` 会缺失。
 * 不带标签的信用代码（``某某公司（9131…）``）不抽取。
 * ``payment_terms`` 只覆盖"带百分比"的付款计划；纯文字描述（"分三期支付"）不抽。
-* ``prepay_ratio`` **刻意不做** —— 它要从"预付 30%"这类描述里**算出比例**，
-  属语义理解，留给 LLM 阶段（P9）。
+* ``prepay_ratio`` 只从**表格行**里读；正文句里的"预付款为合同总额的百分之三十"
+  或"预付三成"**都不抽**（前者是没做，后者是刻意不做 —— 见保守选择 3）。
+  真实合同若把比例写在正文或附件里，该字段会缺失 → 规则侧停在 ``MISSING_INPUT``。
 """
 
 from __future__ import annotations
@@ -83,6 +90,7 @@ _FIELD_CATALOG: tuple[tuple[str, str, str], ...] = (
     ("effective_date", "生效日期", "DATE"),
     ("expire_date", "到期日期", "DATE"),
     ("payment_terms", "付款条件", "TEXT"),
+    ("prepay_ratio", "预付款比例", "RATIO"),
 )
 
 #: 日期骨架：``2026 年 9 月 14 日`` / ``2026-09-14`` / ``2026/9/14``
@@ -126,6 +134,13 @@ _DATE_FIELDS: tuple[tuple[str, re.Pattern[str]], ...] = (
 #: 付款条件的触发词
 _PAYMENT_MARKER = re.compile(r"%|百分之")
 
+#: 预付款行的标签词。只要求出现「预付」—— 表格里它就是标签单元格，
+#: 不需要更严的模式（``1. 预付款`` / ``预付款`` / ``预付`` 都能认）。
+_PREPAY_LABEL = re.compile(r"预付")
+
+#: 百分比：``30%`` / ``30.5%``；全角 ``％`` 也认（合同里两种都常见）
+_PERCENT = re.compile(r"(?P<num>\d+(?:\.\d+)?)\s*[%％]")
+
 
 # --------------------------------------------------------------------------- #
 # 对外入口
@@ -146,6 +161,7 @@ def extract_metadata(parse_result: ParseResult) -> list[MetadataItem]:
     _collect_amount(paragraphs, found)
     _collect_dates(paragraphs, found)
     _collect_payment_terms(paragraphs, found)
+    _collect_prepay_ratio(paragraphs, found)
 
     # 按字段目录的顺序输出，过滤掉没抽到的
     return [found[key] for key, _label, _value_type in _FIELD_CATALOG if key in found]
@@ -241,6 +257,47 @@ def _collect_payment_terms(paragraphs: list[Paragraph], found: dict[str, Metadat
         else:
             found["payment_terms"] = _item("payment_terms", paragraph.text, paragraph, quote=paragraph.text)
         return
+
+
+def _collect_prepay_ratio(paragraphs: list[Paragraph], found: dict[str, MetadataItem]) -> None:
+    """预付款比例：**表格行**里"标签含预付款 + 同行有百分比"的第一处。
+
+    为什么只认表格行：付款计划表里「预付款 | 30%」是**结构化事实** ——
+    标签与比例在同一行的固定位置，读出来不需要理解语义（见模块 docstring 的保守选择 3）。
+    正文句里的写法一律不认，那属于 P9 的 LLM 阶段。
+
+    与 ``payment_terms`` 的关系：那条抽的是**整块原文**（供人工核对），
+    这条抽的是其中的**一个数值**（供规则比较）。两者各取各的第一处，互不影响 ——
+    也正因为如此，本函数**不读** ``found["payment_terms"]``。
+    """
+    for paragraph in paragraphs:
+        if paragraph.block_type != "TABLE_ROW":
+            continue
+        if _PREPAY_LABEL.search(paragraph.text) is None:
+            continue
+
+        match = _PERCENT.search(paragraph.text)
+        if match is None:
+            # 标签行里没有合法百分比 —— 这一行不产出，继续往后找（"第一处**确定**匹配"）
+            continue
+
+        found["prepay_ratio"] = _item(
+            "prepay_ratio",
+            _percent_to_ratio(match.group("num")),
+            paragraph,
+            quote=paragraph.text,
+        )
+        return
+
+
+def _percent_to_ratio(percent: str) -> str:
+    """``"30"`` → ``"0.3"``；``"30.5"`` → ``"0.305"``。
+
+    规范化成**纯数字串**（与 ``contract_amount`` 同一风格），下游 ``Decimal(value)``
+    直接可比。``format(..., "f")`` 是为了绝不退化成科学计数法（``Decimal.normalize()``
+    在大数上会产出 ``1E+2`` 这种形式）。
+    """
+    return format((Decimal(percent) / 100).normalize(), "f")
 
 
 # --------------------------------------------------------------------------- #

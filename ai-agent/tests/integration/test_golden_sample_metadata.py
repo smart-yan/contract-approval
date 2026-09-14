@@ -82,8 +82,24 @@ def test_effective_date_is_absent(items) -> None:
     assert _by_key(items, "expire_date").field_value == "2029-09-13"
 
 
-def test_extracted_field_set_is_exactly_the_eight_available(items) -> None:
-    assert [i.field_key for i in items] == [key for key, *_ in EXPECTED] + ["payment_terms"]
+def test_extracted_field_set_is_exactly_the_available_fields(items) -> None:
+    """黄金样例能抽到的字段**正好**是这些（顺序 = 字段目录顺序）。
+
+    ``payment_terms`` / ``prepay_ratio`` 都来自付款计划表：
+    前者是整块原文（人工核对用），后者是表里的比例数值（规则比较用）。
+    """
+    assert [i.field_key for i in items] == [key for key, *_ in EXPECTED] + ["payment_terms", "prepay_ratio"]
+
+
+def test_prepay_ratio_is_read_from_the_payment_table(items) -> None:
+    """预付款比例：**结构化事实**，来自付款计划表里的一行。"""
+    item = _by_key(items, "prepay_ratio")
+
+    assert item is not None, "黄金样例的付款表里有「1. 预付款 | 30%」"
+    assert item.field_value == "0.3", "30% 规范化为比例 0.3（纯数字串）"
+    assert item.value_type == "RATIO"
+    assert item.paragraph_index == 18
+    assert item.quote == "1. 预付款\t30%\t合同生效后五（5）个工作日内支付"
 
 
 def test_every_item_has_a_quote_pointing_at_real_text(items, parsed) -> None:

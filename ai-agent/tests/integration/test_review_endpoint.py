@@ -288,8 +288,8 @@ def test_purchase_request_fetches_the_rule_set_and_runs_every_rule(
     evaluations: list[Any] = []
     real_evaluate = _RULE_REVIEW_MODULE.evaluate_rule
 
-    def spy(rule: Any, clauses: list[Any]) -> Any:
-        result = real_evaluate(rule, clauses)
+    def spy(rule: Any, clauses: list[Any], metadata: Any = ()) -> Any:
+        result = real_evaluate(rule, clauses, metadata=metadata)
         evaluations.append(result)
         return result
 
@@ -328,6 +328,67 @@ def test_purchase_request_fetches_the_rule_set_and_runs_every_rule(
     body = response.json()
     assert body["workflow_status"] == "completed"
     assert body["error_code"] is None
+
+
+@pytest.mark.parametrize(
+    ("prepay_cell", "expected_status"),
+    [
+        ("30%", RuleEvaluationStatus.NOT_MATCHED),  # 恰好等于阈值，gt 不成立
+        ("50%", RuleEvaluationStatus.MATCHED),  # 超过阈值 → 真的命中
+    ],
+)
+def test_purchase_request_feeds_metadata_into_the_threshold_rule(
+    agent: Callable[[Handler], TestClient],
+    monkeypatch: pytest.MonkeyPatch,
+    prepay_cell: str,
+    expected_status: RuleEvaluationStatus,
+) -> None:
+    """端到端（P8-3）：DOCX 里的付款表 → P7-2 抽出比例 → THRESHOLD 得到确定结论。
+
+    改前这条规则恒为 ``EVALUATION_FAILED``；现在它真的被比过了 ——
+    而且 30% 与 50% 给出**不同**的结论，说明不是"随便给个状态"。
+    """
+    evaluations: list[Any] = []
+    real_evaluate = _RULE_REVIEW_MODULE.evaluate_rule
+
+    def spy(rule: Any, clauses: list[Any], metadata: Any = ()) -> Any:
+        result = real_evaluate(rule, clauses, metadata=metadata)
+        evaluations.append(result)
+        return result
+
+    monkeypatch.setattr(_RULE_REVIEW_MODULE, "evaluate_rule", spy)
+
+    async def contract_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(201, json=SUCCESS_PAYLOAD)
+
+    # 一份带**真实表格**的 DOCX：付款计划表里「1. 预付款 | <比例>」
+    payload = docx_bytes(
+        "第一条 付款方式",
+        "付款计划如下：",
+        [["付款阶段", "比例"], ["1. 预付款", prepay_cell], ["2. 到货款", "60%"]],
+    )
+
+    response = _post(agent(contract_handler), payload=payload)
+
+    threshold = next(e for e in evaluations if e.rule_code == "PAY_PREPAY_RATIO_001")
+    assert threshold.status is expected_status
+    assert threshold.status is not RuleEvaluationStatus.EVALUATION_FAILED, "GAP-C 已闭合"
+
+    if expected_status is RuleEvaluationStatus.MATCHED:
+        (risk,) = threshold.risks
+        assert risk.risk_code == "PAY_PREPAY_RATIO_001"
+        assert "预付款" in risk.quote, "定位回到付款表那一行"
+        assert risk.risk_level == "MEDIUM"
+    else:
+        assert threshold.risks == []
+
+    # 另外两条规则不受影响（KEYWORD 仍然照常跑）
+    assert [e.rule_code for e in evaluations][:2] == [
+        "IP_OWNER_SUPPLIER_001",
+        "LIAB_UNLIMITED_001",
+    ]
+    assert response.status_code == 200
+    assert response.json()["workflow_status"] == "completed"
 
 
 def test_contract_type_without_rule_set_still_completes(

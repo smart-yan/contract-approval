@@ -22,8 +22,9 @@ from app.core.constants import ClauseType, RuleType
 from app.parsers import parse_document_file
 from app.rules import AgentRule, EvaluationFailureReason, RuleEvaluationStatus, evaluate_rule
 from app.schemas.document import ParseResult
-from app.schemas.understanding import Clause
+from app.schemas.understanding import Clause, MetadataItem
 from app.understanding.clauses import identify_clauses
+from app.understanding.metadata import extract_metadata
 
 SAMPLE = Path(__file__).resolve().parents[3] / "samples" / "采购合同-风险版.docx"
 
@@ -85,6 +86,12 @@ def clauses(parsed: ParseResult) -> list[Clause]:
     return identify_clauses(parsed)
 
 
+@pytest.fixture(scope="module")
+def metadata(parsed: ParseResult) -> list[MetadataItem]:
+    """P7-2 抽出的元数据 —— THRESHOLD 规则的值来源（P8-3）。"""
+    return extract_metadata(parsed)
+
+
 def _rule(rule_code: str) -> AgentRule:
     return next(rule for rule in SEED_RULES if rule.rule_code == rule_code)
 
@@ -119,14 +126,40 @@ def test_hits_land_inside_clauses_of_the_expected_type(clauses: list[Clause]) ->
         assert clause.clause_type == expected_types[rule_code]
 
 
-def test_prepay_threshold_rule_cannot_be_evaluated(clauses: list[Clause]) -> None:
-    """**GAP-C 的可视化**：``prepay_ratio`` 没有被 P7-2 抽取，因此这条规则算不出来。
+def test_prepay_threshold_rule_gets_a_definite_answer(
+    clauses: list[Clause], metadata: list[MetadataItem]
+) -> None:
+    """**GAP-C 已闭合**（P8-3）：付款表里的 30% 让这条规则得到确定结论。
 
-    它必须停在 ``EVALUATION_FAILED`` —— 一旦有人把它变成 MATCHED 或 NOT_MATCHED
-    （比如偷偷在别处补了个默认值），这个断言就是第一个报警的地方。
+    黄金样例的付款表写着「1. 预付款 | 30%」，规则是 ``prepay_ratio > 0.3`` ——
+    30% 恰好**等于**阈值，``gt`` 不成立，所以是 ``NOT_MATCHED``（不是"没超标"的猜测，
+    是真的比过了）。风险结果与改前一致：都是空。
+    """
+    result = evaluate_rule(_rule("PAY_PREPAY_RATIO_001"), clauses, metadata=metadata)
+
+    assert result.status is RuleEvaluationStatus.NOT_MATCHED
+    assert result.status is not RuleEvaluationStatus.EVALUATION_FAILED
+    assert result.failure_reason is None
+    assert result.risks == []
+
+
+def test_prepay_threshold_rule_without_metadata_still_cannot_be_evaluated(
+    clauses: list[Clause],
+) -> None:
+    """**没有值来源时结论一个字没变** —— 仍然是不能求值，绝不是"没超标"。
+
+    这是那条防线：拿不到值就停在 ``MISSING_INPUT``，谁都不许把它折成 NOT_MATCHED。
     """
     result = evaluate_rule(_rule("PAY_PREPAY_RATIO_001"), clauses)
 
     assert result.status is RuleEvaluationStatus.EVALUATION_FAILED
     assert result.failure_reason is EvaluationFailureReason.MISSING_INPUT
     assert result.risks == []
+
+
+def test_prepay_ratio_actually_reaches_the_evaluator(metadata: list[MetadataItem]) -> None:
+    """值是真的从文档里读出来的：0.3 来自付款表第 18 段那一行。"""
+    item = next(m for m in metadata if m.field_key == "prepay_ratio")
+
+    assert item.field_value == "0.3"
+    assert item.paragraph_index == 18

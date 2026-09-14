@@ -21,7 +21,7 @@ from app.rules.schemas import (
     RuleEvaluationStatus,
 )
 from app.schemas.document import ParseResult
-from app.schemas.understanding import Clause
+from app.schemas.understanding import Clause, MetadataItem
 from app.understanding.clauses import identify_clauses
 from tests.factories import make_parse_result, para
 
@@ -427,8 +427,8 @@ def test_unknown_rule_type_is_evaluation_failed() -> None:
     assert result.failure_reason is EvaluationFailureReason.UNSUPPORTED_RULE_TYPE
 
 
-def test_threshold_without_value_source_is_not_reported_as_not_matched() -> None:
-    """GAP-C：``prepay_ratio`` 没有被 P7-2 抽取，因此**算不出来** —— 不是"没超标"。"""
+def test_threshold_without_metadata_is_not_reported_as_not_matched() -> None:
+    """没给 metadata（值来源缺失）时**算不出来** —— 不是"没超标"。"""
     clauses = _clauses("第一条 付款", "预付款为合同总额的 30%。")
 
     result = evaluate_rule(
@@ -469,6 +469,155 @@ def test_threshold_invalid_expression(expression: dict) -> None:
 
     assert result.status is RuleEvaluationStatus.EVALUATION_FAILED
     assert result.failure_reason is EvaluationFailureReason.INVALID_EXPRESSION
+
+
+# --------------------------------------------------------------------------- #
+# THRESHOLD 拿到 metadata 之后（P8-3）
+#
+# 求值器**不抽取**：它只拿 metadata 里已经规范化的值来比。
+# --------------------------------------------------------------------------- #
+def _metadata_item(field_key: str, field_value: str, *, paragraph_index: int = 18):
+    return MetadataItem(
+        field_key=field_key,
+        field_label="预付款比例",
+        field_value=field_value,
+        value_type="RATIO",
+        paragraph_index=paragraph_index,
+        quote="1. 预付款\t30%\t合同生效后五个工作日内支付",
+        extract_method="REGEX",
+    )
+
+
+def _threshold_rule(**overrides) -> AgentRule:
+    payload = {
+        "rule_code": "PAY_PREPAY_RATIO_001",
+        "rule_name": "预付款比例超过 30%",
+        "dimension": "金额支付",
+        "rule_type": "THRESHOLD",
+        "expression": {"field": "prepay_ratio", "op": "gt", "value": 0.3},
+        "target_clause_types": ["AMOUNT_PAYMENT"],
+        "severity": "MEDIUM",
+    }
+    payload.update(overrides)
+    return _rule(**payload)
+
+
+def test_threshold_equal_value_does_not_match() -> None:
+    """``0.30 > 0.3`` 不成立 —— 恰好等于阈值不算"超过"。"""
+    clauses = _clauses("第一条 付款", "付款方式见付款计划表。")
+
+    result = evaluate_rule(_threshold_rule(), clauses, metadata=[_metadata_item("prepay_ratio", "0.3")])
+
+    assert result.status is RuleEvaluationStatus.NOT_MATCHED
+    assert result.risks == []
+
+
+def test_threshold_over_the_limit_matches() -> None:
+    clauses = _clauses("第一条 付款", "付款方式见付款计划表。")
+
+    result = evaluate_rule(_threshold_rule(), clauses, metadata=[_metadata_item("prepay_ratio", "0.5")])
+
+    assert result.status is RuleEvaluationStatus.MATCHED
+    assert result.failure_reason is None
+
+
+def test_threshold_risk_locator_comes_from_metadata() -> None:
+    """命中风险的定位来自 metadata —— 段落序号与 quote 都是文档里真实存在的。"""
+    result = evaluate_rule(
+        _threshold_rule(), [], metadata=[_metadata_item("prepay_ratio", "0.5", paragraph_index=18)]
+    )
+
+    (risk,) = result.risks
+    assert risk.paragraph_index == 18
+    assert risk.quote == "1. 预付款\t30%\t合同生效后五个工作日内支付"
+    assert risk.original_text == risk.quote
+    assert risk.risk_code == "PAY_PREPAY_RATIO_001"
+    assert risk.risk_level == "MEDIUM"
+    assert risk.source == "RULE"
+    assert "0.5" in risk.reason and "0.3" in risk.reason
+
+
+def test_threshold_uses_decimal_not_float() -> None:
+    """``0.1 + 0.2`` 那种浮点误差不能影响判定：值走 ``Decimal(str(...))``。"""
+    clauses = _clauses("第一条 付款", "付款方式见付款计划表。")
+
+    # 0.3 与 "0.3" 必须**恰好相等**（float(0.3) 直接参与比较会带上二进制误差）
+    result = evaluate_rule(
+        _threshold_rule(expression={"field": "prepay_ratio", "op": "eq", "value": 0.3}),
+        clauses,
+        metadata=[_metadata_item("prepay_ratio", "0.3")],
+    )
+
+    assert result.status is RuleEvaluationStatus.MATCHED
+
+
+@pytest.mark.parametrize(
+    ("op", "actual", "expected"),
+    [
+        ("gt", "0.31", True),
+        ("gt", "0.3", False),
+        ("gte", "0.3", True),
+        ("lt", "0.29", True),
+        ("lt", "0.3", False),
+        ("lte", "0.3", True),
+        ("eq", "0.3", True),
+        ("ne", "0.3", False),
+    ],
+)
+def test_threshold_operator_semantics(op: str, actual: str, expected: bool) -> None:
+    clauses = _clauses("第一条 付款", "付款方式见付款计划表。")
+
+    result = evaluate_rule(
+        _threshold_rule(expression={"field": "prepay_ratio", "op": op, "value": 0.3}),
+        clauses,
+        metadata=[_metadata_item("prepay_ratio", actual)],
+    )
+
+    assert (result.status is RuleEvaluationStatus.MATCHED) is expected
+
+
+@pytest.mark.parametrize("op", ["GE", ">", "between", "", " eq"])
+def test_unknown_threshold_operator_is_invalid_expression(op: str) -> None:
+    """不认识的 ``op`` 直接失败 —— 不猜、不降级成某种默认比较。"""
+    result = evaluate_rule(
+        _threshold_rule(expression={"field": "prepay_ratio", "op": op, "value": 0.3}),
+        [],
+        metadata=[_metadata_item("prepay_ratio", "0.5")],
+    )
+
+    assert result.status is RuleEvaluationStatus.EVALUATION_FAILED
+    assert result.failure_reason is EvaluationFailureReason.INVALID_EXPRESSION
+
+
+def test_threshold_field_missing_from_metadata_is_not_matched_but_failed() -> None:
+    """metadata 里没有这个字段 → **仍然算不出来**，不是"没超标"。"""
+    result = evaluate_rule(_threshold_rule(), [], metadata=[_metadata_item("contract_amount", "1200000.00")])
+
+    assert result.status is RuleEvaluationStatus.EVALUATION_FAILED
+    assert result.failure_reason is EvaluationFailureReason.MISSING_INPUT
+    assert result.status is not RuleEvaluationStatus.NOT_MATCHED
+    assert "prepay_ratio" in result.failure_message
+
+
+@pytest.mark.parametrize("value", ["三成", "", "30%", "abc"])
+def test_threshold_non_numeric_metadata_value_is_not_matched_but_failed(value: str) -> None:
+    """值不是数字 → 同样**算不出来**。求值器不负责把 "30%" 解析成 0.3（那是抽取的事）。"""
+    result = evaluate_rule(_threshold_rule(), [], metadata=[_metadata_item("prepay_ratio", value)])
+
+    assert result.status is RuleEvaluationStatus.EVALUATION_FAILED
+    assert result.failure_reason is EvaluationFailureReason.MISSING_INPUT
+    assert result.status is not RuleEvaluationStatus.NOT_MATCHED
+
+
+def test_keyword_and_regex_ignore_metadata() -> None:
+    """KEYWORD / REGEX **完全不看 metadata** —— 传了也不影响结论。"""
+    clauses = _clauses("第一条 知识产权", "知识产权归乙方所有。")
+
+    without = evaluate_rule(_rule(), clauses)
+    with_metadata = evaluate_rule(_rule(), clauses, metadata=[_metadata_item("prepay_ratio", "0.9")])
+
+    assert without == with_metadata
+    assert with_metadata.status is RuleEvaluationStatus.MATCHED
 
 
 # --------------------------------------------------------------------------- #

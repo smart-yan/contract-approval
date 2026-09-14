@@ -87,7 +87,10 @@ EXPECTED_METADATA_FIELDS = {
     "extract_method",
 }
 
-#: P7-2 的最小字段集（不含刻意留到 LLM 阶段的 prepay_ratio）
+#: P7-2 的字段集。
+#: ``prepay_ratio`` 于 **P8-3** 加入：它曾因"要从'预付 30%'里算出比例，属语义理解"
+#: 被留到 LLM 阶段；裁决后改为**只认表格行**的结构化事实（标签 + 比例单元格同处一行），
+#: 因此回到确定性抽取。自然语言写法（"预付三成"）仍然不抽。
 EXPECTED_METADATA_KEYS = {
     "our_party_name",
     "counterparty_name",
@@ -98,6 +101,7 @@ EXPECTED_METADATA_KEYS = {
     "effective_date",
     "expire_date",
     "payment_terms",
+    "prepay_ratio",
 }
 
 
@@ -114,11 +118,14 @@ def test_metadata_item_does_not_carry_out_of_scope_fields(forbidden: str) -> Non
 
 
 def test_extract_metadata_produces_exactly_the_agreed_field_set() -> None:
-    """抽取器能产出的 field_key 必须正好是约定的 9 个 —— 不多不少。"""
+    """抽取器能产出的 field_key 必须正好是约定的这批 —— 不多不少。
+
+    新增字段必须**显式**改这个集合（P8-3 加 ``prepay_ratio`` 就是这么做的）：
+    口径变化不能悄悄发生。
+    """
     from app.understanding.metadata import _FIELD_CATALOG
 
     assert {key for key, _label, _type in _FIELD_CATALOG} == EXPECTED_METADATA_KEYS
-    assert "prepay_ratio" not in EXPECTED_METADATA_KEYS, "它留到 LLM 阶段"
 
 
 def test_every_metadata_field_has_a_label_and_a_value_type() -> None:
@@ -127,7 +134,7 @@ def test_every_metadata_field_has_a_label_and_a_value_type() -> None:
 
     for key, label, value_type in _FIELD_CATALOG:
         assert label, f"{key} 缺展示名"
-        assert value_type in {"TEXT", "AMOUNT", "DATE", "CODE"}, f"{key} 的值类型越界"
+        assert value_type in {"TEXT", "AMOUNT", "DATE", "CODE", "RATIO"}, f"{key} 的值类型越界"
 
 
 # --------------------------------------------------------------------------- #

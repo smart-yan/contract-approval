@@ -77,6 +77,9 @@ def rule_review(state: ContractReviewState) -> dict[str, object]:
     """
     snapshot = state.get("rule_snapshot")
     clauses = state.get("clauses") or []
+    # P7-2 已经抽好的元数据**原样递下去** —— 节点不解析它、不转换它。
+    # THRESHOLD 规则按 expression["field"] 在里面查值；KEYWORD / REGEX 不看它。
+    metadata = state.get("metadata") or []
 
     if snapshot is None:
         # 规则快照没进 Workflow：这是编排/前置输入的异常，**不是"没有规则"**。
@@ -97,7 +100,7 @@ def rule_review(state: ContractReviewState) -> dict[str, object]:
 
     # 顺序 = snapshot.rules 的顺序（Backend 已按 sort_order ASC, id ASC 排好）。
     # 这里不排序、不筛选、不跳过任何一条规则 —— 包括我们算不出来的那些。
-    evaluations = [evaluate_rule(rule, clauses) for rule in snapshot.rules]
+    evaluations = [evaluate_rule(rule, clauses, metadata=metadata) for rule in snapshot.rules]
 
     # 展平但不重建：RuleRisk 原样搬运，定位信息（paragraph_index / quote）随对象一起走
     risks = [risk for evaluation in evaluations for risk in evaluation.risks]

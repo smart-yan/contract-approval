@@ -18,7 +18,7 @@ from app.rules.schemas import (
     RuleRisk,
     RuleSetSnapshot,
 )
-from app.schemas.understanding import Clause
+from app.schemas.understanding import Clause, MetadataItem
 from app.understanding.clauses import identify_clauses
 from tests.factories import make_parse_result, para
 
@@ -198,7 +198,7 @@ def test_missing_rule_snapshot_does_not_run_the_evaluator(monkeypatch) -> None:
     """没拿到规则就**不要求值** —— 不能拿一份空的规则去跑出"没命中"。"""
     calls: list[str] = []
 
-    def spy(rule: AgentRule, clauses: list[Clause]) -> RuleEvaluationResult:
+    def spy(rule: AgentRule, clauses: list[Clause], metadata: object = ()) -> RuleEvaluationResult:
         calls.append(rule.rule_code)
         raise AssertionError("不该被调用")
 
@@ -285,6 +285,74 @@ def test_locator_fields_are_not_lost() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# metadata 透传（P8-3）
+# --------------------------------------------------------------------------- #
+PREPAY_METADATA = MetadataItem(
+    field_key="prepay_ratio",
+    field_label="预付款比例",
+    field_value="0.3",
+    value_type="RATIO",
+    paragraph_index=18,
+    quote="1. 预付款\t30%\t合同生效后五（5）个工作日内支付",
+    extract_method="REGEX",
+)
+
+
+def test_node_passes_state_metadata_to_the_evaluator(monkeypatch) -> None:
+    """节点把 State 里的 metadata **原样**递下去 —— 它自己不解析、不转换、不筛选。"""
+    captured: list[object] = []
+    real_evaluate = _RULE_REVIEW_MODULE.evaluate_rule
+
+    def spy(rule: AgentRule, clauses: list[Clause], metadata: object = ()) -> RuleEvaluationResult:
+        captured.append(metadata)
+        return real_evaluate(rule, clauses, metadata=metadata)
+
+    monkeypatch.setattr(_RULE_REVIEW_MODULE, "evaluate_rule", spy)
+
+    updates = rule_review(
+        {
+            "rule_snapshot": _snapshot(THRESHOLD_RULE),
+            "clauses": _clauses(*DOCUMENT),
+            "metadata": [PREPAY_METADATA],
+        }
+    )
+
+    assert captured == [[PREPAY_METADATA]]
+    assert captured[0] is captured[0], "递下去的是 State 里那一个对象，不是复制品"
+    (evaluation,) = updates["rule_evaluations"]
+    assert evaluation.status is RuleEvaluationStatus.NOT_MATCHED, "0.3 不超过 0.3"
+
+
+def test_threshold_rule_gets_a_definite_answer_when_metadata_is_present() -> None:
+    """有值可算时，THRESHOLD 从"无法求值"变成**确定结论**；风险定位来自 metadata。"""
+    over_limit = PREPAY_METADATA.model_copy(update={"field_value": "0.5"})
+
+    updates = rule_review(
+        {
+            "rule_snapshot": _snapshot(THRESHOLD_RULE),
+            "clauses": _clauses(*DOCUMENT),
+            "metadata": [over_limit],
+        }
+    )
+
+    (evaluation,) = updates["rule_evaluations"]
+    assert evaluation.status is RuleEvaluationStatus.MATCHED
+    (risk,) = updates["rule_risks"]
+    assert risk.paragraph_index == 18
+    assert risk.quote == over_limit.quote
+    assert risk.risk_code == "PAY_PREPAY_RATIO_001"
+
+
+def test_metadata_absent_still_stops_at_missing_input() -> None:
+    """没有 metadata（P7-2 没抽到该字段）时结论**一个字没变**：仍是 MISSING_INPUT。"""
+    updates = rule_review({"rule_snapshot": _snapshot(THRESHOLD_RULE), "clauses": _clauses(*DOCUMENT)})
+
+    (evaluation,) = updates["rule_evaluations"]
+    assert evaluation.status is RuleEvaluationStatus.EVALUATION_FAILED
+    assert evaluation.failure_reason is EvaluationFailureReason.MISSING_INPUT
+
+
+# --------------------------------------------------------------------------- #
 # 节点不实现求值逻辑
 # --------------------------------------------------------------------------- #
 def test_node_delegates_to_the_evaluator(monkeypatch) -> None:
@@ -305,7 +373,7 @@ def test_node_delegates_to_the_evaluator(monkeypatch) -> None:
         quote="哨兵",
     )
 
-    def fake_evaluate(rule: AgentRule, clauses: list[Clause]) -> RuleEvaluationResult:
+    def fake_evaluate(rule: AgentRule, clauses: list[Clause], metadata: object = ()) -> RuleEvaluationResult:
         calls.append((rule.rule_code, list(clauses)))
         return RuleEvaluationResult(
             rule_code=rule.rule_code,

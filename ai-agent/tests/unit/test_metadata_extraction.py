@@ -318,6 +318,111 @@ def test_payment_terms_falls_back_to_a_paragraph() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 预付款比例（P8-3）
+#
+# 只认**表格行**里"标签含预付款 + 同行有百分比"的结构化事实；
+# 自然语言写法（"预付三成"）刻意不抽 —— 那是 P9 的 LLM 阶段。
+# --------------------------------------------------------------------------- #
+def test_prepay_ratio_comes_from_the_table_row() -> None:
+    result = make_parse_result(
+        para("第三条 付款方式"),
+        row("付款阶段", "比例", "付款条件"),
+        row("1. 预付款", "30%", "合同生效后支付"),
+        row("2. 到货款", "60%", "交付后支付"),
+    )
+
+    item = _by_key(extract_metadata(result), "prepay_ratio")
+
+    assert item.field_value == "0.3"
+    assert item.value_type == "RATIO"
+    assert item.field_label == "预付款比例"
+    assert item.paragraph_index == 2, "定位到**预付款那一行**，不是表格块首行"
+    assert item.quote == "1. 预付款\t30%\t合同生效后支付"
+
+
+def test_prepay_ratio_normalizes_a_decimal_percent() -> None:
+    """``30.5%`` 是合法比例（0.305）—— 不是"不抽"。"""
+    result = make_parse_result(row("预付款", "30.5%", "合同生效后支付"))
+
+    assert _value(extract_metadata(result), "prepay_ratio") == "0.305"
+
+
+def test_prepay_ratio_without_a_percent_row_is_not_extracted() -> None:
+    result = make_parse_result(
+        row("付款阶段", "比例", "付款条件"),
+        row("1. 预付款", "见附件", "合同生效后支付"),
+    )
+
+    assert _by_key(extract_metadata(result), "prepay_ratio") is None
+
+
+def test_prepay_ratio_is_not_derived_from_natural_language() -> None:
+    """「预付三成」这类写法**刻意不抽** —— 要理解语义，属 P9。"""
+    result = make_parse_result(
+        para("双方约定预付款为合同总额的三成，余款交付后支付。"),
+        para("乙方应在收款前开具发票。"),
+    )
+
+    assert _by_key(extract_metadata(result), "prepay_ratio") is None
+
+
+def test_prepay_ratio_is_not_taken_from_a_plain_paragraph() -> None:
+    """正文句里写着百分比也不抽 —— 只认表格行（结构化事实）。"""
+    result = make_parse_result(para("1. 预付款 30% 于合同生效后支付。"))
+
+    assert _by_key(extract_metadata(result), "prepay_ratio") is None
+
+
+def test_first_prepay_row_wins() -> None:
+    result = make_parse_result(
+        row("1. 预付款", "30%", "合同生效后支付"),
+        row("2. 预付款补充", "50%", "交付后支付"),
+    )
+
+    item = _by_key(extract_metadata(result), "prepay_ratio")
+
+    assert item.field_value == "0.3"
+    assert item.paragraph_index == 0
+
+
+def test_prepay_row_without_percent_does_not_block_a_later_one() -> None:
+    """前一行的标签行没有合法百分比 → 继续往后找"第一处**确定**匹配"。"""
+    result = make_parse_result(
+        row("预付款", "见附件", "合同生效后支付"),
+        row("预付款（补充）", "40%", "交付后支付"),
+    )
+
+    item = _by_key(extract_metadata(result), "prepay_ratio")
+
+    assert item.field_value == "0.4"
+    assert item.paragraph_index == 1
+
+
+def test_non_prepay_rows_are_ignored() -> None:
+    result = make_parse_result(
+        row("付款阶段", "比例", "付款条件"),
+        row("1. 到货款", "60%", "交付后支付"),
+        row("2. 质保金", "10%", "质保期满支付"),
+    )
+
+    assert _by_key(extract_metadata(result), "prepay_ratio") is None
+
+
+def test_prepay_ratio_does_not_change_payment_terms() -> None:
+    """两条各自独立取第一处 —— 抽预付款比例不能影响付款条件的既有行为。"""
+    result = make_parse_result(
+        row("付款阶段", "比例", "付款条件"),
+        row("1. 预付款", "30%", "合同生效后支付"),
+        row("2. 到货款", "60%", "交付后支付"),
+    )
+
+    items = extract_metadata(result)
+
+    assert _by_key(items, "payment_terms").paragraph_index == 0, "仍是整块，从首行起"
+    assert _value(items, "prepay_ratio") == "0.3"
+
+
+# --------------------------------------------------------------------------- #
 # 契约
 # --------------------------------------------------------------------------- #
 def test_extract_method_is_regex_for_every_item() -> None:

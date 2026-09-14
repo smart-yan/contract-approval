@@ -29,16 +29,20 @@
 ========================  ==========================================================
 ``KEYWORD``               已实现：``{"keywords": [...], "logic": "ANY"}``
 ``REGEX``                 已实现（最小）：``{"pattern": "<正则>"}``
+``THRESHOLD``             已实现（P8-3）：``{"field": ..., "op": ..., "value": ...}``，
+                          值从 ``metadata`` 里按 ``field`` 查；
+                          查不到 → ``EVALUATION_FAILED`` / ``MISSING_INPUT``
 ``EXISTS`` / ``MISSING``  **未实现**：架构文档 §7.2 未给出 ``expression`` 契约 →
                           ``EVALUATION_FAILED`` / ``UNSUPPORTED_RULE_TYPE``
-``THRESHOLD``             表达式的**形状**已识别，但当前输入没有数值来源 →
-                          ``EVALUATION_FAILED`` / ``MISSING_INPUT``
 不认识的 ``rule_type``      ``EVALUATION_FAILED`` / ``UNSUPPORTED_RULE_TYPE``
 ========================  ==========================================================
 
-**为什么 EXISTS/MISSING/THRESHOLD 是"失败"而不是"未命中"**：它们不是"没算出结果"，
-而是"我们还没有求值它们的手段"。把缺手段表达成"未命中"，等于宣称一份必备条款缺失
-的合同没问题 —— 那是**静默漏报**。宁可让结果显式地不可用，也不假装判断过了。
+**为什么无法求值时是"失败"而不是"未命中"**：那意味着**我们没有判断的依据**
+（表达式不认识，或算它需要的事实根本没抽出来）。把"缺依据"表达成"未命中"，
+等于宣称一份必备条款缺失的合同没问题 —— 那是**静默漏报**。
+宁可让结果显式地不可用，也不假装判断过了。
+``THRESHOLD`` 现在能给出确定结论了，但**只在真拿到值的时候** ——
+拿不到值仍然是 ``MISSING_INPUT``，语义一个字没变。
 
 **为什么不自行发明表达式**：§11.1 列了 10 条 MISSING 规则，但 ``expression`` 长什么样
 文档里一个字都没有。在此刻发明一套 DSL，等于把"猜"固化成契约 —— 而规则数据是要落库、
@@ -65,7 +69,9 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from decimal import Decimal, InvalidOperation
+from operator import eq, ge, gt, le, lt, ne
 from typing import Any
 
 from app.core.constants import ClauseType, RuleType
@@ -76,11 +82,23 @@ from app.rules.schemas import (
     RuleEvaluationStatus,
     RuleRisk,
 )
-from app.schemas.understanding import Clause
+from app.schemas.understanding import Clause, MetadataItem
 
 #: KEYWORD 目前唯一实现的组合逻辑。``logic`` 出现其它取值时**求值失败**而不是退化成
 #: ANY —— 把 ``ALL`` 当成 ``ANY`` 会凭空多报风险，这是最不该有的错误。
 _SUPPORTED_KEYWORD_LOGIC = "ANY"
+
+#: THRESHOLD 支持的比较运算符。**取值集合在 P8-1 刻意留白**（"留给提供数值的那一层"），
+#: 现在这一层到了（P8-3），所以在这里钉死一份：不认识的 ``op`` 一律 ``INVALID_EXPRESSION``。
+#: 比较用 :class:`~decimal.Decimal`，不用 float —— 见 :func:`_parse_threshold_expression`。
+_THRESHOLD_OPS: dict[str, Callable[[Decimal, Decimal], bool]] = {
+    "gt": gt,
+    "gte": ge,
+    "lt": lt,
+    "lte": le,
+    "eq": eq,
+    "ne": ne,
+}
 
 #: Agent 认识的条款类型取值。取自 :class:`~app.core.constants.ClauseType` 本身，
 #: 而不是再抄一份字符串 —— 那份枚举已被 ``test_understanding_contract.py`` 钉死为 11 个值，
@@ -100,13 +118,21 @@ class _InvalidExpression(Exception):
 # --------------------------------------------------------------------------- #
 # 对外入口
 # --------------------------------------------------------------------------- #
-def evaluate_rule(rule: AgentRule, clauses: Sequence[Clause]) -> RuleEvaluationResult:
+def evaluate_rule(
+    rule: AgentRule,
+    clauses: Sequence[Clause],
+    metadata: Sequence[MetadataItem] = (),
+) -> RuleEvaluationResult:
     """求值一条规则。**不抛异常**（见下方"异常策略"）。
 
     :param rule: Agent 侧的规则模型（由 ``rule_from_backend`` 从 Backend 目录映射而来）
     :param clauses: **已识别出的**条款，顺序即文档顺序（``identify_clauses`` 的输出）。
         ``clauses`` 为空表示"文档里没有任何条款"——对 KEYWORD / REGEX 而言，
         这就是**未命中**（确实没找到），而不是无法求值
+    :param metadata: **已抽出的**元数据（``extract_metadata`` 的输出）。
+        只有 THRESHOLD 用得上（按 ``expression["field"]`` 查值）；
+        KEYWORD / REGEX **完全不看它**。默认空 —— 调用方没给值时，
+        THRESHOLD 会停在 ``MISSING_INPUT``，而不是被当成"没超标"
     :return: 三态结果；MATCHED 时 ``risks`` 按文档顺序排列
 
     异常策略
@@ -133,7 +159,7 @@ def evaluate_rule(rule: AgentRule, clauses: Sequence[Clause]) -> RuleEvaluationR
     if rule.rule_type == RuleType.REGEX:
         return _evaluate_regex(rule, clauses)
     if rule.rule_type == RuleType.THRESHOLD:
-        return _evaluate_threshold(rule, clauses)
+        return _evaluate_threshold(rule, clauses, metadata)
     if rule.rule_type in (RuleType.EXISTS, RuleType.MISSING):
         return _failed(
             rule,
@@ -272,43 +298,74 @@ def _compile_pattern(expression: Mapping[str, Any]) -> re.Pattern[str]:
 # --------------------------------------------------------------------------- #
 # THRESHOLD
 # --------------------------------------------------------------------------- #
-def _evaluate_threshold(rule: AgentRule, clauses: Sequence[Clause]) -> RuleEvaluationResult:
-    """数值比较：**当前无值可算，恒为 MISSING_INPUT**。
+def _evaluate_threshold(
+    rule: AgentRule, clauses: Sequence[Clause], metadata: Sequence[MetadataItem]
+) -> RuleEvaluationResult:
+    """数值比较：拿 ``expression["field"]`` 去 **metadata** 里查值，再按 ``op`` 比。
 
-    这不是没写完，而是输入里确实没有数值来源：本函数的入参只有规则与条款，
-    而 :func:`evaluate_rule` 的契约（P8-1）**不引入任何 metadata 推导**
-    ``expression["field"]`` 指向的字段（如 ``prepay_ratio``）恰恰是 P7-2
-    **刻意没有抽取**的（GAP-C：它要从"预付 30%"这类描述里算出比例，
-    属于派生指标，不是文档里写着的事实）。
+    值的来源
+    ------
+    只从 :class:`~app.schemas.understanding.MetadataItem` 里取，**不自己从条款文本里算**：
+    把 "30%" 变成 0.3 是**抽取**（P7-2 的事），不是求值。
+    求值器的职责是"拿到一个已经规范化的值，判断它是否越线"。
 
-    所以这里做两件事：
-    1. 校验 ``expression`` 的**形状**（缺字段 / 类型不对 → INVALID_EXPRESSION）
-    2. 形状合法但无值可算 → MISSING_INPUT，并把缺的那个字段名说清楚
+    三种结局
+    ------
+    * 值查到且可比 → ``MATCHED`` / ``NOT_MATCHED`` —— 这才是**确定的判断**
+    * 字段查不到、或值转不成数字 → ``MISSING_INPUT``
+    * ``expression`` 形状不对、``op`` 不认识 → ``INVALID_EXPRESSION``
 
-    **绝不能返回 NOT_MATCHED** —— 那等于宣称"预付款比例没超标"，
+    后两者都**绝不能返回 NOT_MATCHED** —— 那等于宣称"这个指标没超标"，
     而我们根本没有算过它。
+
+    ``clauses`` 在这个分支用不上，但签名与其它求值器保持一致 ——
+    "有没有可用的值"的答案只应该在求值器内部给出，而不是让调用方先判断一次。
     """
     try:
-        field = _parse_threshold_expression(rule.expression)
+        field, op, threshold = _parse_threshold_expression(rule.expression)
     except _InvalidExpression as exc:
         return _failed(rule, EvaluationFailureReason.INVALID_EXPRESSION, str(exc))
 
-    # ``clauses`` 在这个分支用不上，但签名与其它求值器保持一致 ——
-    # "有没有可用的值"的答案只应该在求值器内部给出，而不是让调用方先判断一次。
-    return _failed(
+    item = next((candidate for candidate in metadata if candidate.field_key == field), None)
+    if item is None:
+        return _failed(
+            rule,
+            EvaluationFailureReason.MISSING_INPUT,
+            f"expression 要求比较字段 {field!r}，但这次求值的输入（metadata）里没有这个字段。"
+            "**这是无法求值，不是未命中** —— 没有任何依据说这个指标没超标。",
+        )
+
+    actual = _to_decimal(item.field_value)
+    if actual is None:
+        return _failed(
+            rule,
+            EvaluationFailureReason.MISSING_INPUT,
+            f"metadata 里 {field!r} 的值 {item.field_value!r} 不是数字，无法参与比较。"
+            "**这是无法求值，不是未命中**。",
+        )
+
+    if not _THRESHOLD_OPS[op](actual, threshold):
+        return _not_matched(rule)
+
+    return _matched(
         rule,
-        EvaluationFailureReason.MISSING_INPUT,
-        f"expression 要求比较字段 {field!r} 的数值，但 P8-1 的求值输入只有「规则 + 已识别条款」，"
-        f"没有任何可计算出 {field!r} 的数值来源（GAP-C：该字段未被 P7-2 抽取，"
-        "派生指标需要单独设计）。**这是无法求值，不是未命中**。",
+        [
+            _build_risk(
+                rule,
+                paragraph_index=item.paragraph_index,
+                original_text=item.quote,
+                quote=item.quote,
+                reason=f"规则要求 {field} {op} {threshold}，实际值为 {actual}（取自「{item.field_label}」）",
+            )
+        ],
     )
 
 
-def _parse_threshold_expression(expression: Mapping[str, Any]) -> str:
-    """校验 ``{"field": ..., "op": ..., "value": ...}`` 的形状，返回 ``field``。
+def _parse_threshold_expression(expression: Mapping[str, Any]) -> tuple[str, str, Decimal]:
+    """校验 ``{"field": ..., "op": ..., "value": ...}``，返回 ``(field, op, value)``。
 
-    只校验**形状**，不校验 ``op`` 的取值集合 —— 取值集合属于将来那个"提供数值"的
-    那一层（它才知道支持哪些比较），在这里钉死一份只会多一处会漂移的声明。
+    ``op`` 的取值集合在 P8-1 刻意留白（"留给提供数值的那一层"）—— 那一层就是这里，
+    所以由本函数钉死：**不认识的 op 直接失败**，不猜、不降级成某种默认比较。
     """
     field = expression.get("field")
     if not isinstance(field, str) or not field:
@@ -317,15 +374,26 @@ def _parse_threshold_expression(expression: Mapping[str, Any]) -> str:
         )
 
     op = expression.get("op")
-    if not isinstance(op, str) or not op:
-        raise _InvalidExpression("expression 缺少非空字符串 op（如 gt / gte / lt）")
+    if not isinstance(op, str) or op not in _THRESHOLD_OPS:
+        raise _InvalidExpression(f"expression.op 必须是 {sorted(_THRESHOLD_OPS)} 之一，实际是 {op!r}")
 
     value = expression.get("value")
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         # bool 是 int 的子类，必须显式挡掉 —— 否则 True 会被当成 1 通过
         raise _InvalidExpression(f"expression.value 必须是数字，实际是 {value!r}")
 
-    return field
+    # 从 JSON 来的是 float，Decimal(0.3) 会把二进制误差一起带进来
+    # （0.3 实际是 0.29999999999999998889776975374843…）。
+    # 先转成 str 再转 Decimal，拿到的才是"人写下的那个数"。
+    return field, op, Decimal(str(value))
+
+
+def _to_decimal(raw: str) -> Decimal | None:
+    """metadata 的值 → ``Decimal``；不是数字则返回 ``None``。"""
+    try:
+        return Decimal(raw)
+    except InvalidOperation:
+        return None
 
 
 # --------------------------------------------------------------------------- #
