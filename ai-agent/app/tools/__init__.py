@@ -9,11 +9,12 @@
 后续阶段的 Tool 在真正需要时再加，不提前铺开。
 """
 
-from app.tools.backend_client import BackendClient, UploadOutcome
+from app.tools.backend_client import BackendClient, BackendRequestError, UploadOutcome
 from app.tools.contract_ingest import ContractIngestRequest, ContractIngestResult, ContractIngestTool
 
 __all__ = [
     "BackendClient",
+    "BackendRequestError",
     "ContractIngestRequest",
     "ContractIngestResult",
     "ContractIngestTool",

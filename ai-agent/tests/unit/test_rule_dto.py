@@ -14,7 +14,13 @@ import pytest
 from pydantic import ValidationError
 
 from app.core.constants import RuleType
-from app.rules.schemas import AgentRule, EvaluationFailureReason, RuleRisk, rule_from_backend
+from app.rules.schemas import (
+    AgentRule,
+    EvaluationFailureReason,
+    RuleRisk,
+    RuleSetSnapshot,
+    rule_from_backend,
+)
 
 #: 与 ``backend/app/schemas/rule.py::RuleItem`` 同形的一条规则（含 Backend 的 ``id``）
 BACKEND_RULE_ITEM = {
@@ -186,6 +192,42 @@ def test_expression_is_carried_verbatim() -> None:
 
     assert rule.expression == expression
     assert rule.dimension == "知识产权", "dimension 原样搬运，不映射成枚举码"
+
+
+# --------------------------------------------------------------------------- #
+# RuleSetSnapshot 的领域不变量
+#
+# 直接构造 DTO 也要挡住自相矛盾的快照 —— 不变量属于**对象**，不只是映射函数的产物。
+# --------------------------------------------------------------------------- #
+def test_snapshot_without_rule_set_must_have_no_rules() -> None:
+    with pytest.raises(ValidationError):
+        RuleSetSnapshot(
+            contract_type="PURCHASE",
+            rule_set_version=None,
+            rules=[rule_from_backend(BACKEND_RULE_ITEM)],
+        )
+
+
+def test_snapshot_without_rule_set_and_without_rules_is_valid() -> None:
+    snapshot = RuleSetSnapshot(contract_type="SERVICE", rule_set_version=None, rules=[])
+
+    assert snapshot.rules == []
+
+
+def test_snapshot_version_must_not_be_an_empty_string() -> None:
+    """有规则集就有版本 —— 空字符串不是"有版本"。"""
+    with pytest.raises(ValidationError):
+        RuleSetSnapshot(contract_type="PURCHASE", rule_set_version="", rules=[])
+
+
+@pytest.mark.parametrize("rule_count", [0, 1])
+def test_snapshot_with_version_accepts_any_rule_count(rule_count: int) -> None:
+    """有版本时 0 条与 N 条都合法（规则集存在，只是可能没配规则）。"""
+    rules = [rule_from_backend(BACKEND_RULE_ITEM)] * rule_count
+
+    snapshot = RuleSetSnapshot(contract_type="PURCHASE", rule_set_version="v1", rules=rules)
+
+    assert len(snapshot.rules) == rule_count
 
 
 # --------------------------------------------------------------------------- #

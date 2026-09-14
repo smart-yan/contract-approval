@@ -76,6 +76,69 @@ class AgentRule(BaseModel):
     sort_order: int = Field(description="展示与执行顺序。P8-1 不求值它，只为保持与数据源同形")
 
 
+class RuleSetSnapshot(BaseModel):
+    """某合同类型下**当前启用**的规则集快照 —— Agent 求值的规则来源。
+
+    ::
+
+        RuleSetSnapshot
+        ├── contract_type
+        ├── rule_set_version
+        └── rules[]  ──▶  AgentRule …
+
+    ``rule_set_version`` 为 ``None`` 等价于 Backend 的 ``rule_set=null``：
+    **该合同类型没有配置启用的规则集**。这**不是错误**（架构裁决：
+    没有规则集不能阻止上传），因此快照仍是一个合法对象，``rules`` 为空列表，
+    流程照常继续 —— 只是这一份合同没有任何规则可跑。
+
+    ⚠️ ``version`` 在这里而不是在 :class:`AgentRule` 上：它是**规则集这一层**的属性
+    （这一批规则作为一个整体是哪个版本），不是某条规则的属性。
+    它也不是给求值器用的，而是给下游记录"这次审查依据的是哪一版规则"用的。
+    本轮**不消费它**（P8-2 的任务幂等键才会用到）。
+
+    ⚠️ Backend 的 ``rule_set.id`` **不进来**：Agent 不需要数据库身份，
+    规则集的身份由 ``contract_type`` + ``rule_set_version`` 表达。
+    ``rule_set.name`` / ``description`` 同理不收 —— 没有消费者。
+
+    领域不变量（下面校验器强制）
+    --------------------------
+    ==================================  ==========================================
+    ``rule_set_version is None``         ⇔ **没有规则集** ⇒ ``rules`` 必须为空
+    ``rule_set_version`` 有值            ⇒ 必须是非空字符串（有规则集就有版本）
+    ==================================  ==========================================
+
+    为什么这两条必须成立：``rule_set_version is None`` 在下游读作
+    "该合同类型没有配置规则集"，是一个**正常结论**。若它同时带着一堆规则，
+    同一份快照就自相矛盾 —— 而无论下游往哪边解读（当成"没有规则集"而忽略规则、
+    或当成"有规则"而丢掉版本），都是**静默丢信息**。所以宁可在这里失败。
+    """
+
+    contract_type: str = Field(description="规则集适用的合同类型，取值见 core.constants.ContractType")
+    rule_set_version: str | None = Field(
+        default=None,
+        description="规则集版本（如 v1）；``None`` 表示该合同类型**没有启用规则集**（此时 rules 必为空）。"
+        "Backend 的 ``rule_set.id`` 不进入 Agent",
+    )
+    rules: list[AgentRule] = Field(
+        default_factory=list,
+        description="启用规则，**保持 Backend 返回的顺序**（已是 ``sort_order ASC, id ASC``）；"
+        "没有规则集时为空列表。Agent 不重排 —— 顺序的权威在 Backend",
+    )
+
+    @model_validator(mode="after")
+    def _reject_version_rules_mismatch(self) -> RuleSetSnapshot:
+        """版本与规则必须互相说得通（见类 docstring 的不变量表）。"""
+        if self.rule_set_version is None:
+            if self.rules:
+                raise ValueError(
+                    f"rule_set_version 为 None（= 没有规则集）时 rules 必须为空，实际有 {len(self.rules)} 条"
+                )
+            return self
+        if not self.rule_set_version:
+            raise ValueError("rule_set_version 要么为 None（没有规则集），要么是非空字符串")
+        return self
+
+
 class RuleRisk(BaseModel):
     """规则命中产生的一条**最小**风险结果。
 
@@ -220,5 +283,6 @@ __all__ = [
     "RuleEvaluationResult",
     "RuleEvaluationStatus",
     "RuleRisk",
+    "RuleSetSnapshot",
     "rule_from_backend",
 ]

@@ -2,17 +2,20 @@
 
 把「规则目录里的规则」变成「风险结果」：
 
-* ``schemas``   —— Agent 侧规则模型与风险结果契约；Backend → Agent 的映射
+* ``schemas``   —— Agent 侧契约：规则模型、规则集快照、风险结果；规则映射
   （``rule_from_backend``）
+* ``catalog``   —— Backend 规则目录响应 → ``RuleSetSnapshot``（纯映射，P8-2 第一小步）
 * ``evaluator`` —— **纯函数**求值器：``evaluate_rule(rule, clauses)``
 
 **规则数据归 Backend、求值引擎归 Agent**（架构文档 §17 的 P8 行）。
-这一层不认识 State、不认识 Graph、不访问 Backend —— 因此能脱离整张图单独测试。
+这一层不认识 State、不认识 Graph、不发 HTTP（HTTP 在 ``app/tools``）——
+因此能脱离整张图单独测试。
 
-⚠️ P8-1 只到求值器为止：``rule_review`` 节点、从 Backend 拉规则、
-把结果写进 State 都属于 **P8-2**。
+⚠️ P8-2 的进度：规则集快照契约（本模块）已完成；``rule_review`` 节点、
+把结果写进 State **仍未实现**。
 """
 
+from app.rules.catalog import RuleSnapshotError, snapshot_from_backend
 from app.rules.evaluator import evaluate_rule
 from app.rules.schemas import (
     AgentRule,
@@ -20,6 +23,7 @@ from app.rules.schemas import (
     RuleEvaluationResult,
     RuleEvaluationStatus,
     RuleRisk,
+    RuleSetSnapshot,
     rule_from_backend,
 )
 
@@ -29,6 +33,9 @@ __all__ = [
     "RuleEvaluationResult",
     "RuleEvaluationStatus",
     "RuleRisk",
+    "RuleSetSnapshot",
+    "RuleSnapshotError",
     "evaluate_rule",
     "rule_from_backend",
+    "snapshot_from_backend",
 ]

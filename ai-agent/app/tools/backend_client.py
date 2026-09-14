@@ -9,6 +9,10 @@ Backend 在 P4 已经实现了文件类型校验（扩展名 / MIME / 魔数）�
 1. 把文件与业务元数据 POST 给 ``POST /api/v1/contracts``
 2. 把 Backend 的响应 / 错误翻译成 State 能承载的结果
 
+P8-2 起它多一个职责：**把规则目录拉回来**（``GET /api/v1/rule-sets``）。
+注意这里**只做传输**：响应体原样交给 ``app/rules/catalog.py`` 解释 ——
+本模块不认识 ``AgentRule``，也不求值（规则数据归 Backend、求值引擎归 Agent）。
+
 P5-5 引入 Tool Calling 时，会把这里的方法包装成 LangChain Tool，
 但**网络实现不变** —— 这也是把 HTTP 细节单独放一层的原因。
 
@@ -38,6 +42,37 @@ API_V1_PREFIX = "/api/v1"
 
 #: 201 = 新建成功；200 = 命中 sha256 复用了已有记录。两者都算成功。
 _SUCCESS_STATUS: frozenset[int] = frozenset({200, 201})
+
+
+class BackendRequestError(Exception):
+    """一次 Backend 请求失败：连不上 / 超时 / 非 2xx / 响应体不是 JSON 对象。
+
+    为什么规则集用异常，而上传用 :class:`UploadOutcome` 返回值
+    -------------------------------------------------------
+    ``upload_contract`` 是一次**业务动作**：被拒绝（格式不支持、超过大小上限）
+    也是一种要展示给用户的结果，所以它连同成功信息一起返回，由节点决定怎么写进 State。
+
+    规则集不一样：它是**后续所有求值的前提**。取不到就没有任何可继续的余地，
+    也不存在"部分成功" —— 调用方必须处理它。用异常是为了让这个处理动作
+    **强制出现在代码里看得见的地方**，而不是靠调用方记得检查一个返回字段。
+
+    ⚠️ 这不违背"失败写进 State、由 Conditional Edge 分流"：异常只在**没被接住**时向上冒。
+    接住它并翻译成 State 是 P8-2 节点的事 —— 本层只负责把失败**说清楚**。
+
+    :param status_code: Backend 的 HTTP 状态码；连不上时为 ``None``
+    :param error_code: Backend 统一错误体里的 ``code``，或 :class:`AgentErrorCode` 取值
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        error_code: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.error_code = error_code
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,5 +234,58 @@ class BackendClient:
             error_message=error_message,
         )
 
+    # ------------------------------ 规则目录 ------------------------------ #
+    async def get_effective_rule_set(self, contract_type: str) -> dict[str, Any]:
+        """调用 ``GET /api/v1/rule-sets``，返回**原始响应体**（dict）。
 
-__all__ = ["API_V1_PREFIX", "BackendClient", "UploadOutcome"]
+        职责只有 transport 这一段：**HTTP → Python 结构**。
+        2xx + JSON 对象 → 原样返回；其余一律抛 :class:`BackendRequestError`。
+        **不做任何领域解释** —— 响应体里有什么规则、``rule_set=null`` 意味着什么，
+        都由 ``app/rules/catalog.py`` 的 ``snapshot_from_backend`` 回答。
+        这里不认识 ``AgentRule``，不映射字段，不求值。
+
+        "该合同类型没有启用的规则集"是 **200 + ``rule_set=null``**，
+        因此它是一个**成功**的返回值，不是错误。
+        """
+        client = self._ensure_client()
+
+        try:
+            response = await client.get(
+                f"{self._api_base}/rule-sets",
+                params={"contract_type": contract_type},
+                timeout=self._timeout,
+            )
+        except httpx.HTTPError as exc:
+            raise BackendRequestError(
+                f"调用 Backend 读取规则集失败：{exc}",
+                error_code=AgentErrorCode.BACKEND_UNREACHABLE.value,
+            ) from exc
+
+        if response.status_code not in _SUCCESS_STATUS:
+            error_code, error_message = _extract_error(response)
+            raise BackendRequestError(
+                f"Backend 拒绝读取规则集（HTTP {response.status_code}）：{error_message}",
+                status_code=response.status_code,
+                error_code=error_code,
+            )
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise BackendRequestError(
+                f"Backend 返回 {response.status_code}，但响应体不是 JSON",
+                status_code=response.status_code,
+                error_code=AgentErrorCode.BACKEND_REJECTED.value,
+            ) from exc
+
+        if not isinstance(payload, dict):
+            # 和 upload_contract 同一口径：2xx 但形状不对，属于契约被破坏
+            raise BackendRequestError(
+                "Backend 的规则集响应不是 JSON 对象",
+                status_code=response.status_code,
+                error_code=AgentErrorCode.BACKEND_REJECTED.value,
+            )
+        return payload
+
+
+__all__ = ["API_V1_PREFIX", "BackendClient", "BackendRequestError", "UploadOutcome"]
