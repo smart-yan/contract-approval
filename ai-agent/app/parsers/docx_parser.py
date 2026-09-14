@@ -25,10 +25,33 @@
 
 ⚠️ 已知取舍：表格行与普通段落在数据结构上不再可区分。**P6-1 刻意不做区分** ——
 要不要给它们不同的类型，取决于 P7 条款识别怎么用，现在决定就是猜。
+
+文本清洗规则（P6-2 收口）
+----------------------
+**段落文本与单元格文本一律压成单行**：所有空白（含 ``<w:br/>`` 换行、``<w:tab/>``
+制表符、连续空格）折叠为一个空格，再去掉首尾空白。
+
+为什么必须清洗 —— 这不是"顺手美化"，而是位置契约能否成立的前提：
+
+``ParseResult.text`` 是各段落用 ``\n`` 拼接出来的。而 python-docx 的
+``Paragraph.text`` **本身就可能含 ``\n``**（作者插入的软换行会变成换行符，已实测）。
+一旦段落内部带 ``\n``，"第几个 ``\n`` 是段落边界"就再也分不出来 ——
+``text`` 与 ``paragraphs`` 之间**不可逆**，P9 存下的段落位置、P11 的原文高亮
+全部会指错地方。
+
+清洗后有三个可断言的不变量：
+
+1. 段落文本**不含** ``\n``
+2. 段落文本**不含** ``\t``（单元格内也清洗过，所以 ``\t`` 只可能是单元格分隔符）
+3. 因此 ``text`` 里的每个 ``\n`` 都是一个段落边界 —— **位置可逆**
+
+⚠️ 代价：作者插入的软换行会被抹平成空格。对合同文本分析来说这是可接受的 ——
+软换行是排版行为，不是语义边界；而"能定位"是不能让的。
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -44,6 +67,20 @@ from app.schemas.document import Paragraph, ParseResult
 
 #: 表格行内单元格之间的连接符（制表符，与文本抽取工具的惯例一致）
 _CELL_SEPARATOR = "\t"
+
+#: 任何连续的空白（空格 / 制表符 / 换行 / 全角空格……）。
+#: Python 的 ``\s`` 对 str 默认按 Unicode 匹配，中文全角空格（U+3000）也算 ——
+#: 中文合同里它常被当作分隔符，折叠成普通空格符合预期。
+_WHITESPACE_RUN = re.compile(r"\s+")
+
+
+def normalize_text(text: str) -> str:
+    """把一段文本压成**单行**：连续空白折叠为一个空格，并去掉首尾空白。
+
+    规则与理由见模块 docstring —— 它的作用是保证 ``\\n`` 只作为**段落分隔符**出现，
+    从而让 ``ParseResult.text`` 与 ``paragraphs`` 互为可还原。
+    """
+    return _WHITESPACE_RUN.sub(" ", text).strip()
 
 
 class DocxParser(DocumentParser):
@@ -90,10 +127,11 @@ class DocxParser(DocumentParser):
         """
         for child in document.element.body.iterchildren():
             if child.tag == qn("w:p"):
-                yield DocxParagraph(child, document).text.strip()
+                yield normalize_text(DocxParagraph(child, document).text)
             elif child.tag == qn("w:tbl"):
                 for row in Table(child, document).rows:
-                    yield _CELL_SEPARATOR.join(cell.text.strip() for cell in row.cells)
+                    # 单元格先各自压成单行，再用 \t 拼接 —— 于是 \t 只可能是列边界
+                    yield _CELL_SEPARATOR.join(normalize_text(cell.text) for cell in row.cells)
 
 
-__all__ = ["DocxParser"]
+__all__ = ["DocxParser", "normalize_text"]
