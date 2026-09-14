@@ -93,6 +93,19 @@ class BlockReasonCode(StrEnum):
     INTERNAL_ERROR = "INTERNAL_ERROR"  # 其它内部错误
 
 
+class ParseStatus(StrEnum):
+    """单文件解析状态（§7.2 ``contract_file.parse_status``）。
+
+    P4（合同文件接入）上传成功后**只设置** ``PENDING``；
+    实际的解析状态流转由 **P7**（文档解析引擎）负责，本阶段不实现流转逻辑。
+    """
+
+    PENDING = "PENDING"  # 已接入，等待解析
+    PARSING = "PARSING"  # 解析中
+    PARSED = "PARSED"  # 解析完成
+    FAILED = "FAILED"  # 解析失败
+
+
 # =========================================================================== #
 # 二、回写状态机（架构文档 §6.2）
 # =========================================================================== #

@@ -22,6 +22,7 @@ ALLOWED_ENUMS = {
     "TaskStatus",
     "TaskStage",
     "BlockReasonCode",
+    "ParseStatus",  # P4：contract_file.parse_status 的取值集合
     "WritebackStatus",
     # §11 风险
     "RiskLevel",

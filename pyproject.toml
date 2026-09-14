@@ -11,4 +11,4 @@ dependencies = []
 package = false
 
 [tool.uv.workspace]
-members = ["backend"]
+members = ["backend", "ai-agent"]

@@ -46,6 +46,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
 from app.api.health import router as health_router
+from app.api.v1.router import api_v1_router
 from app.core.config import get_settings
 from app.core.errors import AppError, ErrorCode
 from app.core.executors import install_default_executor, shutdown_executors
@@ -178,6 +179,9 @@ def create_app() -> FastAPI:
 
     # 基础设施端点（健康检查不属于业务接口，故不加 /api/v1 前缀）
     app.include_router(health_router)
+
+    # 业务接口：统一前缀 /api/v1（§8）。P4 只挂载合同接入，其余资源随对应阶段加入。
+    app.include_router(api_v1_router, prefix=settings.api_v1_prefix)
 
     app.middleware("http")(request_context_middleware)
 

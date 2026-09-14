@@ -62,8 +62,8 @@ def test_create_app_sets_metadata() -> None:
     assert application.docs_url == "/docs"
 
 
-def test_health_route_is_mounted_without_api_prefix(app: FastAPI) -> None:
-    """健康检查是基础设施端点，不应挂在 /api/v1 下。
+def test_health_route_stays_at_root_not_under_api_prefix(app: FastAPI) -> None:
+    """健康检查是基础设施端点，始终挂在根路径，不随业务路由一起进 /api/v1。
 
     刻意通过 OpenAPI schema 内省路径，而不是遍历 ``app.routes``：
     新版 FastAPI/Starlette 的 ``include_router`` 会把子路由包成 ``_IncludedRouter``
@@ -72,7 +72,27 @@ def test_health_route_is_mounted_without_api_prefix(app: FastAPI) -> None:
     """
     paths = set(app.openapi()["paths"])
     assert "/health" in paths
-    assert not any(p.startswith("/api/v1") for p in paths), "P2-d 不实现业务路由"
+    assert "/api/v1/health" not in paths
+
+
+def test_only_approved_business_routes_are_mounted(app: FastAPI) -> None:
+    """``/api/v1`` 下的路由白名单守卫。
+
+    【本用例的前身是 P2-d 的 ``test_health_route_is_mounted_without_api_prefix``】
+    它当时断言 ``/api/v1`` 下**一条路由都没有**（P2-d 不实现业务路由）。
+    P4 引入了第一个已批准的业务路由，该断言必然失效——按守卫的本意改写为
+    "**只允许已批准的路由出现**"，而不是删掉测试。
+
+    新增业务端点时**必须同步修改此白名单**：这样"未经裁决就加路由"会直接在 CI 暴露。
+    """
+    approved = {"/api/v1/contracts"}
+
+    paths = set(app.openapi()["paths"])
+    mounted = {path for path in paths if path.startswith("/api/v1")}
+
+    assert mounted == approved, (
+        f"未批准的 /api/v1 路由：{mounted - approved}；缺失的已批准路由：{approved - mounted}"
+    )
 
 
 def test_create_app_returns_independent_instances() -> None:

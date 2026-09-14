@@ -80,6 +80,7 @@ class ErrorCode(StrEnum):
 
     # -------------------------- 基础设施 -------------------------- #
     DATABASE_UNAVAILABLE = "DATABASE_UNAVAILABLE"
+    STORAGE_UNAVAILABLE = "STORAGE_UNAVAILABLE"
 
     # ------------------------ 合同与附件 ------------------------ #
     CONTRACT_NOT_FOUND = "CONTRACT_NOT_FOUND"
@@ -149,6 +150,8 @@ ERROR_SPECS: dict[ErrorCode, ErrorSpec] = {
     # -------------------------- 基础设施 -------------------------- #
     # SYSTEM_ERROR ⇒ 可重试：数据库瞬时不可用属于基础设施故障，退避重试有意义
     ErrorCode.DATABASE_UNAVAILABLE: ErrorSpec(503, ErrorCategory.SYSTEM_ERROR, "数据库暂时不可用"),
+    # 文件存储（磁盘满 / 权限不足 / 目录不可写）同属基础设施故障，可重试
+    ErrorCode.STORAGE_UNAVAILABLE: ErrorSpec(503, ErrorCategory.SYSTEM_ERROR, "文件存储暂时不可用"),
     # ------------------------ 合同与附件 ------------------------ #
     ErrorCode.CONTRACT_NOT_FOUND: ErrorSpec(404, ErrorCategory.USER_ERROR, "合同不存在"),
     ErrorCode.FILE_NOT_FOUND: ErrorSpec(404, ErrorCategory.USER_ERROR, "附件不存在"),

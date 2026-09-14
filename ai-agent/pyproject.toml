@@ -1,0 +1,38 @@
+[project]
+name = "contract-review-agent"
+version = "0.1.0"
+description = "合同审批审查系统 - AI Agent 服务（LangGraph 编排的合同智能审查流程）"
+requires-python = ">=3.12"
+
+# ⚠️ 刻意**不引入** SQLAlchemy / aiomysql：
+# Agent 不直接访问数据库，所有业务数据读写都通过 Backend 的领域 API（架构裁决 C4）。
+dependencies = [
+    "fastapi>=0.141.1",
+    "httpx>=0.28.1",
+    "langchain-core>=1.6.3",
+    "langgraph>=1.2.11",
+    "pydantic-settings>=2.15.0",
+    "python-multipart>=0.0.32",
+    "uvicorn[standard]>=0.52.4",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.28",
+    "ruff>=0.8",
+]
+
+# 应用项目，不作为 Python 包安装；从 ai-agent/ 目录运行 uvicorn 即可
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"

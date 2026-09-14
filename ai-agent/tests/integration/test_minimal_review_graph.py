@@ -1,0 +1,242 @@
+"""P5-3 最小 Graph 的端到端行为。
+
+只 mock **网络层**（``httpx.MockTransport``），不 mock Agent 自己的节点 ——
+这样 multipart 编码、响应解析、State 流转、Conditional Edge 分流全都真实执行，
+测出来的才是"Graph 真的跑起来了"，而不是"我 mock 的东西按我想的返回了"。
+
+四个用例对应四类走向：
+
+============================  ==========================================
+用例                           期望
+============================  ==========================================
+合法文件                        upload → validate → parse → END
+非法文件（Backend 415）         upload → validate → END（不进入 parse）
+Backend 不可达                  upload → validate → END
+成功响应但字段不全               upload → validate → END
+============================  ==========================================
+"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator, Callable, Coroutine
+from pathlib import Path
+from typing import Any
+
+import httpx
+import pytest
+
+from app.graph.builder import build_review_graph
+from app.graph.context import ReviewContext
+from app.tools.backend_client import BackendClient
+
+BACKEND_BASE_URL = "http://backend.test"
+EXPECTED_UPLOAD_URL = f"{BACKEND_BASE_URL}/api/v1/contracts"
+
+#: Backend ``POST /api/v1/contracts`` 成功响应的真实形状（见 backend/app/schemas/contract.py）
+SUCCESS_PAYLOAD: dict[str, Any] = {
+    "contract_id": 11,
+    "contract_no": "HT-2026-001",
+    "title": "设备采购合同",
+    "contract_type": "PURCHASE",
+    "contract_status": "PENDING",
+    "file_id": 22,
+    "filename": "contract.pdf",
+    "file_size": 1234,
+    "file_type": "PDF",
+    "sha256": "a" * 64,
+    "parse_status": "PENDING",
+    "review_task_id": 33,
+    "task_status": "PENDING",
+    "task_stage": "UPLOADED",
+    "reused": False,
+}
+
+#: 合法的 PDF 头，保证"上传的确实是 Agent 拿到的那个文件"
+PDF_BYTES = b"%PDF-1.7\n% minimal fixture\n"
+
+Handler = Callable[[httpx.Request], Coroutine[Any, Any, httpx.Response]]
+
+
+@pytest.fixture
+async def make_backend() -> AsyncIterator[Callable[[Handler], BackendClient]]:
+    """构造一个挂了 MockTransport 的 BackendClient，并在用例结束时关闭底层 client。
+
+    Agent 侧的 ``BackendClient`` 接受注入的 ``httpx.AsyncClient``，
+    所以这里不需要 monkeypatch，也不需要起真实 Backend —— 这正是把依赖放进
+    ``ReviewContext`` 而不是全局单例的收益。
+    """
+    opened: list[httpx.AsyncClient] = []
+
+    def _make(handler: Handler) -> BackendClient:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        opened.append(client)
+        return BackendClient(BACKEND_BASE_URL, client=client)
+
+    yield _make
+
+    for client in opened:
+        await client.aclose()
+
+
+@pytest.fixture
+def source_file(tmp_path: Path) -> Path:
+    path = tmp_path / "contract.pdf"
+    path.write_bytes(PDF_BYTES)
+    return path
+
+
+def _initial_state(source_file: Path) -> dict[str, Any]:
+    return {
+        "file_path": str(source_file),
+        "filename": "contract.pdf",
+        "content_type": "application/pdf",
+        "contract_no": "HT-2026-001",
+        "title": "设备采购合同",
+        "contract_type": "PURCHASE",
+    }
+
+
+async def _run(backend: BackendClient, source_file: Path) -> dict[str, Any]:
+    graph = build_review_graph()
+    return await graph.ainvoke(
+        _initial_state(source_file),
+        context=ReviewContext(backend=backend),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Case 1：合法文件 —— upload_file → validate_file → parse_document → END
+# --------------------------------------------------------------------------- #
+async def test_valid_file_runs_through_to_parse(
+    make_backend: Callable[[Handler], BackendClient], source_file: Path
+) -> None:
+    requests: list[httpx.Request] = []
+    bodies: list[bytes] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        bodies.append(await request.aread())
+        return httpx.Response(201, json=SUCCESS_PAYLOAD)
+
+    final = await _run(make_backend(handler), source_file)
+
+    # 1) 确实调用了 Backend 的 P4 接入接口，而不是 Agent 自己解析/落盘
+    assert len(requests) == 1
+    assert requests[0].method == "POST"
+    assert str(requests[0].url) == EXPECTED_UPLOAD_URL
+    assert requests[0].headers["content-type"].startswith("multipart/form-data;")
+    # 表单里带上了 Backend 要求的业务字段，文件字节原样送达
+    assert b'name="contract_no"' in bodies[0]
+    assert b"HT-2026-001" in bodies[0]
+    assert b'name="contract_type"' in bodies[0]
+    assert PDF_BYTES in bodies[0]
+
+    # 2) Backend 返回的标识被带进了 State
+    assert final["contract_id"] == 11
+    assert final["file_id"] == 22
+    assert final["review_task_id"] == 33
+    assert final["sha256"] == "a" * 64
+    assert final["reused"] is False
+
+    # 3) 门禁通过，且 Conditional Edge 确实走了 continue 分支
+    assert final["file_valid"] is True
+    assert final["validation_errors"] == []
+    assert final.get("error_code") is None
+
+    # 4) 解析节点执行了，但只产出桩结果 —— 不伪造合同正文
+    parse_result = final["parse_result"]
+    assert parse_result.status == "STUB"
+    assert parse_result.source_file_type == "PDF"
+    assert parse_result.text == ""
+
+
+# --------------------------------------------------------------------------- #
+# Case 2：非法文件 —— upload_file → validate_file → END（parse_document 不执行）
+# --------------------------------------------------------------------------- #
+async def test_invalid_file_stops_before_parse(
+    make_backend: Callable[[Handler], BackendClient], source_file: Path
+) -> None:
+    """Backend 以 415 拒绝（真实 Backend 对不支持的格式正是这么回的）。"""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            415,
+            json={
+                "code": "UNSUPPORTED_FORMAT",
+                "message": "不支持的文件扩展名：.exe",
+                "details": {"allowed_extensions": [".docx", ".pdf", ".jpg", ".jpeg", ".png"]},
+                "request_id": "req-test",
+            },
+        )
+
+    final = await _run(make_backend(handler), source_file)
+
+    # 保留 Backend 的稳定错误码，而不是换成 Agent 自己的说法
+    assert final["file_valid"] is False
+    assert final["error_code"] == "UNSUPPORTED_FORMAT"
+    assert final["error_message"] == "不支持的文件扩展名：.exe"
+    assert final["validation_errors"]
+
+    # 关键断言：Conditional Edge 走了 stop 分支，解析节点**根本没有执行**
+    assert "parse_result" not in final
+
+
+# --------------------------------------------------------------------------- #
+# 附加：Backend 不可达 —— 同样停在 END，不进入解析
+# --------------------------------------------------------------------------- #
+async def test_backend_unreachable_stops_before_parse(
+    make_backend: Callable[[Handler], BackendClient], source_file: Path
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    final = await _run(make_backend(handler), source_file)
+
+    assert final["file_valid"] is False
+    assert final["error_code"] == "BACKEND_UNREACHABLE"
+    assert "parse_result" not in final
+
+
+# --------------------------------------------------------------------------- #
+# 附加：Backend 返回 2xx 但字段不全 —— 门禁仍然拦得住
+# --------------------------------------------------------------------------- #
+async def test_incomplete_success_payload_stops_before_parse(
+    make_backend: Callable[[Handler], BackendClient], source_file: Path
+) -> None:
+    """契约完整性检查：Backend 改了成功响应字段时，问题在门禁处立刻暴露。"""
+    incomplete = {k: v for k, v in SUCCESS_PAYLOAD.items() if k != "review_task_id"}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(201, json=incomplete)
+
+    final = await _run(make_backend(handler), source_file)
+
+    assert final["file_valid"] is False
+    assert final["error_code"] == "BACKEND_CONTRACT_INCOMPLETE"
+    assert any("review_task_id" in e for e in final["validation_errors"])
+    assert "parse_result" not in final
+
+
+# --------------------------------------------------------------------------- #
+# 附加：输入残缺 —— 连 Backend 都不该调用
+# --------------------------------------------------------------------------- #
+async def test_missing_input_never_calls_backend(
+    make_backend: Callable[[Handler], BackendClient], source_file: Path
+) -> None:
+    calls: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(201, json=SUCCESS_PAYLOAD)
+
+    backend = make_backend(handler)
+    graph = build_review_graph()
+    state = _initial_state(source_file)
+    del state["contract_no"]  # 调用方漏传必需字段
+
+    final = await graph.ainvoke(state, context=ReviewContext(backend=backend))
+
+    assert calls == []
+    assert final["file_valid"] is False
+    assert final["error_code"] == "AGENT_INPUT_INVALID"
+    assert "parse_result" not in final
