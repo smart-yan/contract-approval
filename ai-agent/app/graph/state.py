@@ -55,7 +55,8 @@ class ContractReviewState(TypedDict, total=False):
     sha256: str
     file_type: str
     file_size: int
-    reused: bool  # true 表示 Backend 命中 sha256、复用了已有记录（幂等）
+    reused: bool  # 文件层幂等：Backend 复用了已有 ContractFile
+    task_reused: bool  # 任务层幂等：Backend 复用了已有 ReviewTask
 
     # ---------------------------- validation ---------------------------- #
     file_valid: bool

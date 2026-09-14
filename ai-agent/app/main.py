@@ -6,10 +6,14 @@
 * Agent **不访问数据库**，业务数据读写全部经 Backend 的领域 API。
 * 人工审核**不属于** LangGraph —— 它由 Backend 承载，Agent 跑完即 END。
 
-P5-2 阶段范围
--------------
-本文件当前只提供**服务外壳与健康检查**。编排入口 ``POST /api/agent/review``
-与最小 Graph（upload_file → validate_file → parse_document）属于 P5-3/P5-4。
+当前范围（P5-2 ~ P5-4）
+----------------------
+* ``GET /health`` —— 服务健康检查
+* ``POST /api/agent/review`` —— 编排入口，跑
+  ``upload_file → validate_file →[Conditional Edge]→ parse_document``
+
+**进程内只编译一次 Graph**：编译产物本身是无状态的，每次调用把初始 State 与
+依赖（``ReviewContext``）传进去即可，因此可以安全地在多个并发请求间共享。
 """
 
 from __future__ import annotations
@@ -22,7 +26,10 @@ from typing import Literal
 from fastapi import FastAPI, Request, Response
 from pydantic import BaseModel, Field
 
+from app.api import review_router
 from app.core.config import get_settings
+from app.graph.builder import build_review_graph
+from app.tools.backend_client import BackendClient
 
 APP_VERSION = "0.1.0"
 
@@ -45,8 +52,21 @@ def _configure_logging(level: str) -> None:
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     _configure_logging(settings.log_level)
+
+    # 进程级共享资源：一个 HTTP 连接池 + 一份编译好的 Graph。
+    # 两者都是无状态/可复用的，放进 app.state 由 lifespan 统一管理生命周期，
+    # 避免每个请求各自新建连接池。
+    app.state.backend_client = BackendClient(
+        settings.backend_base_url,
+        timeout_seconds=settings.backend_timeout_seconds,
+    )
+    app.state.review_graph = build_review_graph()
+
     logger.info("AI Agent 服务启动中 | %s", settings.safe_summary())
     yield
+
+    # 只关闭自己创建的资源；图是纯内存对象，无需释放
+    await app.state.backend_client.aclose()
     logger.info("AI Agent 服务关闭")
 
 
@@ -66,13 +86,16 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.include_router(review_router)
+
 
 @app.get("/health", response_model=HealthResponse, tags=["infrastructure"], summary="健康检查")
 async def health(request: Request, response: Response) -> HealthResponse:
     """Agent 自身健康检查。
 
-    ⚠️ **P5 刻意不探测 Backend 的健康状态**：那需要一次出站 HTTP 调用，
-    属于编排链路（P5-5 Tool）的职责，放在健康检查里会让两个服务的探针互相耦合。
+    ⚠️ **刻意不探测 Backend 的健康状态**：那需要一次出站 HTTP 调用，
+    属于编排链路（``POST /api/agent/review``）的职责 ——
+    放在健康检查里会让两个服务的探针互相耦合。
     此处只报告自身状态与配置是否就绪。
     """
     settings = get_settings()
@@ -85,4 +108,4 @@ async def health(request: Request, response: Response) -> HealthResponse:
     )
 
 
-__all__ = ["APP_VERSION", "HealthResponse", "app"]
+__all__ = ["APP_VERSION", "HealthResponse", "app", "lifespan"]

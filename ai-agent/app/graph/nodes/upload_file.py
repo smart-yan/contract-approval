@@ -38,7 +38,8 @@ _PASSTHROUGH_FIELDS: tuple[str, ...] = (
     "sha256",
     "file_type",
     "file_size",
-    "reused",
+    "reused",  # 文件层幂等
+    "task_reused",  # 任务层幂等
 )
 
 
