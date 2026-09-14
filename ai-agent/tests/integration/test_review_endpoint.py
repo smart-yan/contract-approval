@@ -14,7 +14,7 @@ import asyncio
 import tempfile
 from collections.abc import Callable, Coroutine, Iterator
 from contextlib import ExitStack
-from dataclasses import dataclass
+from importlib import import_module
 from pathlib import Path
 from typing import Any
 
@@ -24,9 +24,14 @@ from fastapi.testclient import TestClient
 
 import app.api.review as review_module
 from app.main import app
-from app.rules.schemas import AgentRule, RuleSetSnapshot
+from app.rules.schemas import EvaluationFailureReason, RuleEvaluationStatus
 from app.tools.backend_client import BackendClient
 from tests.factories import docx_bytes
+
+#: 节点模块对象 —— 用于把 ``evaluate_rule`` 换成 spy（见相关用例）。
+#: ⚠️ 不能用字符串 monkeypatch：``nodes/__init__.py`` 重导出了同名函数，
+#: ``app.graph.nodes.rule_review`` 这个名字在包命名空间里指的是**函数**而不是模块。
+_RULE_REVIEW_MODULE = import_module("app.graph.nodes.rule_review")
 
 BACKEND_BASE_URL = "http://backend.test"
 EXPECTED_UPLOAD_URL = f"{BACKEND_BASE_URL}/api/v1/contracts"
@@ -57,44 +62,83 @@ DOCX_BYTES = docx_bytes(*DOCX_PARAGRAPHS)
 
 Handler = Callable[[httpx.Request], Coroutine[Any, Any, httpx.Response]]
 
-#: 一份**合法**的 PURCHASE 规则集快照（与 seed 的规则同形）。
-#: 只放 1 条就够 —— 这两个 happy path 用例断言的是"上传 → 解析"这条链路，
-#: 规则审查本身由 ``test_rule_review_graph.py`` 覆盖。
-PURCHASE_SNAPSHOT = RuleSetSnapshot(
-    contract_type="PURCHASE",
-    rule_set_version="v1",
-    rules=[
-        AgentRule(
-            rule_code="IP_OWNER_SUPPLIER_001",
-            rule_name="知识产权归属相对方",
-            dimension="知识产权",
-            rule_type="KEYWORD",
-            expression={"keywords": ["知识产权归乙方"], "logic": "ANY"},
-            target_clause_types=["IP"],
-            severity="HIGH",
-            sort_order=10,
-        )
+#: ``GET /api/v1/rule-sets?contract_type=PURCHASE`` 的**真实响应**（长文本已截短）
+RULE_SETS_PURCHASE_PAYLOAD: dict[str, Any] = {
+    "contract_type": "PURCHASE",
+    "rule_set": {
+        "id": 1,
+        "name": "采购合同审查清单 v1",
+        "contract_type": "PURCHASE",
+        "version": "v1",
+        "description": "适用于我方作为采购方的软件/货物采购合同。",
+    },
+    "rules": [
+        {
+            "id": 1,
+            "rule_code": "IP_OWNER_SUPPLIER_001",
+            "rule_name": "知识产权归属相对方",
+            "dimension": "知识产权",
+            "rule_type": "KEYWORD",
+            "expression": {"keywords": ["知识产权归乙方"], "logic": "ANY"},
+            "target_clause_types": ["IP"],
+            "severity": "HIGH",
+            "sort_order": 10,
+        },
+        {
+            "id": 3,
+            "rule_code": "LIAB_UNLIMITED_001",
+            "rule_name": "我方单方承担无限责任",
+            "dimension": "违约责任",
+            "rule_type": "KEYWORD",
+            "expression": {"keywords": ["全部损失"], "logic": "ANY"},
+            "target_clause_types": ["LIABILITY"],
+            "severity": "HIGH",
+            "sort_order": 30,
+        },
+        {
+            "id": 5,
+            "rule_code": "PAY_PREPAY_RATIO_001",
+            "rule_name": "预付款比例超过 30%",
+            "dimension": "金额支付",
+            "rule_type": "THRESHOLD",
+            "expression": {"field": "prepay_ratio", "op": "gt", "value": 0.3},
+            "target_clause_types": ["AMOUNT_PAYMENT"],
+            "severity": "MEDIUM",
+            "sort_order": 50,
+        },
     ],
-)
+}
+
+#: ``GET /api/v1/rule-sets?contract_type=SERVICE`` 的真实响应：没有启用的规则集
+RULE_SETS_SERVICE_PAYLOAD: dict[str, Any] = {
+    "contract_type": "SERVICE",
+    "rule_set": None,
+    "rules": [],
+}
 
 
-@dataclass
-class _SnapshotInjectingGraph:
-    """在 Graph 的**初始 State** 里补上 ``rule_snapshot`` —— 模拟编排层的注入。
+def _json_response(payload: dict[str, Any], status_code: int = 200) -> Handler:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, json=payload)
 
-    ⚠️ **生产代码目前没有这一步**：``run_review`` 组装的初始 State 只有上传字段，
-    "规则集怎么从 Backend 取、由谁放进 State" 是 P8-2 的下一小步。
-    这里补上它，是为了让 happy path 具备规则审查所需的**合法前置输入**。
+    return handler
 
-    这不是"绕开 rule_review"：节点照常执行、照常逐条求值 ——
-    只是把当前缺失的那一环在测试里显式地补出来。
+
+def _routes(contract_handler: Handler, rule_sets: Handler | None = None) -> Handler:
+    """把 Backend 的**两个**接口分开。
+
+    真实编排会先 ``GET /rule-sets`` 取规则集，再 ``POST /contracts`` 上传 ——
+    用例自己的 handler 只关心后者，规则集默认返回 PURCHASE 的真实响应，
+    需要别的行为（SERVICE / 失败 / 坏数据）时用 ``agent(..., rule_sets=...)`` 覆盖。
     """
+    rules_handler = rule_sets or _json_response(RULE_SETS_PURCHASE_PAYLOAD)
 
-    graph: Any
-    snapshot: RuleSetSnapshot
+    async def routed(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/rule-sets"):
+            return await rules_handler(request)
+        return await contract_handler(request)
 
-    async def ainvoke(self, state: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
-        return await self.graph.ainvoke({**state, "rule_snapshot": self.snapshot}, **kwargs)
+    return routed
 
 
 @pytest.fixture
@@ -105,20 +149,17 @@ def agent() -> Iterator[Callable[..., TestClient]]:
     因此不需要 monkeypatch 全局、也不需要起真实 Backend ——
     这正是把依赖放进 ``app.state`` 而不是模块级单例的收益。
 
-    :param snapshot: 传入时会包一层 :class:`_SnapshotInjectingGraph` —— 见该类的说明。
+    :param rule_sets: 覆盖 ``GET /rule-sets`` 的行为；默认返回 PURCHASE 的真实响应。
     """
     with ExitStack() as stack:
         opened: list[httpx.AsyncClient] = []
 
-        def _make(handler: Handler, snapshot: RuleSetSnapshot | None = None) -> TestClient:
+        def _make(handler: Handler, rule_sets: Handler | None = None) -> TestClient:
             test_client = stack.enter_context(TestClient(app))
-            transport = httpx.MockTransport(handler)
+            transport = httpx.MockTransport(_routes(handler, rule_sets))
             http_client = httpx.AsyncClient(transport=transport)
             opened.append(http_client)
             app.state.backend_client = BackendClient(BACKEND_BASE_URL, client=http_client)
-            if snapshot is not None:
-                # lifespan 已经建好了图，这里再包一层（必须在 enter_context 之后）
-                app.state.review_graph = _SnapshotInjectingGraph(app.state.review_graph, snapshot)
             return test_client
 
         yield _make
@@ -128,7 +169,7 @@ def agent() -> Iterator[Callable[..., TestClient]]:
             asyncio.run(http_client.aclose())
 
 
-def _post(test_client: TestClient, payload: bytes = DOCX_BYTES) -> Any:
+def _post(test_client: TestClient, payload: bytes = DOCX_BYTES, contract_type: str = "PURCHASE") -> Any:
     return test_client.post(
         "/api/agent/review",
         files={
@@ -141,7 +182,7 @@ def _post(test_client: TestClient, payload: bytes = DOCX_BYTES) -> Any:
         data={
             "contract_no": "HT-2026-001",
             "title": "设备采购合同",
-            "contract_type": "PURCHASE",
+            "contract_type": contract_type,
         },
     )
 
@@ -174,7 +215,7 @@ def test_valid_file_runs_the_whole_workflow(agent: Callable[[Handler], TestClien
         bodies.append(await request.aread())
         return httpx.Response(201, json=SUCCESS_PAYLOAD)
 
-    response = _post(agent(handler, snapshot=PURCHASE_SNAPSHOT))
+    response = _post(agent(handler))
 
     assert response.status_code == 200
     body = response.json()
@@ -237,48 +278,136 @@ def test_unparsable_document_is_never_reported_as_completed(
     assert body["validation_errors"] == []
 
 
-def test_missing_rule_snapshot_is_reported_as_a_workflow_failure(
-    agent: Callable[[Handler], TestClient],
+def test_purchase_request_fetches_the_rule_set_and_runs_every_rule(
+    agent: Callable[[Handler], TestClient], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """没注入规则快照 = 输入缺失的失败：**不能**再返回 completed，但 error 必须透传。
+    """**真实 HTTP 闭环**：PURCHASE → 取到 v1 + 3 条规则 → rule_review 真的跑了 3 条。
 
-    这正是"State 已经判定失败，API 必须如实表达"的最小验证 ——
-    API 不重新判断业务（不看 rule_snapshot），只投影 State。
+    只 mock 网络层的响应内容；取规则、映射、注入 State、逐条求值全部真实执行。
     """
+    evaluations: list[Any] = []
+    real_evaluate = _RULE_REVIEW_MODULE.evaluate_rule
 
-    async def handler(request: httpx.Request) -> httpx.Response:
+    def spy(rule: Any, clauses: list[Any]) -> Any:
+        result = real_evaluate(rule, clauses)
+        evaluations.append(result)
+        return result
+
+    monkeypatch.setattr(_RULE_REVIEW_MODULE, "evaluate_rule", spy)
+
+    rule_set_requests: list[httpx.Request] = []
+
+    async def rules_handler(request: httpx.Request) -> httpx.Response:
+        rule_set_requests.append(request)
+        return httpx.Response(200, json=RULE_SETS_PURCHASE_PAYLOAD)
+
+    async def contract_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(201, json=SUCCESS_PAYLOAD)
 
-    response = _post(agent(handler))  # 刻意不带 snapshot
+    response = _post(agent(contract_handler, rule_sets=rules_handler))
 
-    assert response.status_code == 422, "失败就是失败，不能报 200"
+    # 1) 真的按 contract_type 去 Backend 取了当前启用的规则集
+    assert len(rule_set_requests) == 1
+    assert rule_set_requests[0].method == "GET"
+    assert rule_set_requests[0].url.params["contract_type"] == "PURCHASE"
+
+    # 2) 3 条规则**每条都被求值过**（不是"图跑到了 END"）
+    assert [e.rule_code for e in evaluations] == [
+        "IP_OWNER_SUPPLIER_001",
+        "LIAB_UNLIMITED_001",
+        "PAY_PREPAY_RATIO_001",
+    ]
+
+    # 3) 规则执行失败**保持原样**（THRESHOLD 缺 prepay_ratio，GAP-C）
+    failed = [e for e in evaluations if e.status is RuleEvaluationStatus.EVALUATION_FAILED]
+    assert [e.rule_code for e in failed] == ["PAY_PREPAY_RATIO_001"]
+    assert failed[0].failure_reason is EvaluationFailureReason.MISSING_INPUT
+
+    # 4) 这次请求**不是因为缺 snapshot 而被拒绝**
+    assert response.status_code == 200
     body = response.json()
-    assert body["workflow_status"] == "rejected"
-    assert body["error_code"] == "AGENT_INPUT_INVALID"
-    assert "rule_snapshot" in body["error_message"]
-    # 上传与解析本身是成功的，痕迹保留 —— 失败点不在它们身上
-    assert body["contract_id"] == 11
-    assert body["parse_result"]["status"] == "PARSED"
+    assert body["workflow_status"] == "completed"
+    assert body["error_code"] is None
 
 
-def test_empty_rule_set_is_completed_not_rejected(
+def test_contract_type_without_rule_set_still_completes(
     agent: Callable[[Handler], TestClient],
 ) -> None:
-    """``rule_set_version=None, rules=[]``（该合同类型没配规则）= **正常完成**。
-
-    与上一条的区别只在于"给了一个空快照"而不是"什么都没给"。
-    """
+    """SERVICE：Backend 明确回答"没有启用的规则集"（200 + rule_set=null）= **正常完成**。"""
 
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(201, json=SUCCESS_PAYLOAD)
 
-    empty = RuleSetSnapshot(contract_type="SERVICE", rule_set_version=None, rules=[])
-    response = _post(agent(handler, snapshot=empty))
+    response = _post(
+        agent(handler, rule_sets=_json_response(RULE_SETS_SERVICE_PAYLOAD)),
+        contract_type="SERVICE",
+    )
 
     assert response.status_code == 200
     body = response.json()
     assert body["workflow_status"] == "completed"
     assert body["error_code"] is None
+    assert body["parse_result"]["status"] == "PARSED"
+
+
+def test_rule_set_fetch_failure_is_not_disguised_as_an_empty_rule_set(
+    agent: Callable[[Handler], TestClient],
+) -> None:
+    """取规则失败 → **不伪装成空规则集**，也不假装审查跑完了。"""
+
+    async def contract_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(201, json=SUCCESS_PAYLOAD)
+
+    response = _post(
+        agent(contract_handler, rule_sets=_json_response({"code": "INTERNAL", "message": "boom"}, 500))
+    )
+
+    assert response.status_code == 422
+    body = response.json()
+    assert body["workflow_status"] == "rejected"
+    assert body["error_code"] == "INTERNAL"
+    # 空规则集的表现会是 200 + completed + 无 error —— 这里必须不是
+    assert body["error_code"] is not None
+
+
+def test_rule_set_transport_failure_is_not_disguised_as_an_empty_rule_set(
+    agent: Callable[[Handler], TestClient],
+) -> None:
+    """连不上 Backend 的规则接口 → 同样不许退化成空规则集。"""
+
+    async def contract_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(201, json=SUCCESS_PAYLOAD)
+
+    async def unreachable(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    response = _post(agent(contract_handler, rule_sets=unreachable))
+
+    assert response.status_code == 422
+    body = response.json()
+    assert body["workflow_status"] == "rejected"
+    assert body["error_code"] == "BACKEND_UNREACHABLE"
+
+
+def test_rule_set_conversion_failure_is_not_disguised_as_an_empty_rule_set(
+    agent: Callable[[Handler], TestClient],
+) -> None:
+    """2xx 但内容映不成快照（缺 rules / 缺 version）→ 同样不许退化成空规则集。"""
+
+    async def contract_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(201, json=SUCCESS_PAYLOAD)
+
+    for broken in (
+        {"contract_type": "PURCHASE", "rule_set": {"id": 1, "version": "v1"}},  # 缺 rules
+        {"contract_type": "PURCHASE", "rule_set": {"id": 1}},  # 缺 version
+        {"contract_type": "PURCHASE", "rule_set": None, "rules": [{"rule_code": "X"}]},  # null 却带规则
+    ):
+        response = _post(agent(contract_handler, rule_sets=_json_response(broken)))
+
+        assert response.status_code == 422, broken
+        body = response.json()
+        assert body["workflow_status"] == "rejected"
+        assert body["error_code"] == "BACKEND_CONTRACT_INCOMPLETE", broken
 
 
 def test_empty_document_is_completed_not_rejected(
@@ -289,7 +418,7 @@ def test_empty_document_is_completed_not_rejected(
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(201, json=SUCCESS_PAYLOAD)
 
-    response = _post(agent(handler, snapshot=PURCHASE_SNAPSHOT), payload=docx_bytes())
+    response = _post(agent(handler), payload=docx_bytes())
 
     assert response.status_code == 200
     body = response.json()
@@ -359,7 +488,7 @@ def test_upload_temp_file_is_removed_after_the_request(
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(201, json=SUCCESS_PAYLOAD)
 
-    response = _post(agent(handler, snapshot=PURCHASE_SNAPSHOT))
+    response = _post(agent(handler))
 
     assert response.status_code == 200
     assert len(created) == 1, "应当恰好落盘一个临时文件"
