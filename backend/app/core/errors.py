@@ -78,6 +78,9 @@ class ErrorCode(StrEnum):
     CONFLICT = "CONFLICT"
     RATE_LIMITED = "RATE_LIMITED"
 
+    # -------------------------- 基础设施 -------------------------- #
+    DATABASE_UNAVAILABLE = "DATABASE_UNAVAILABLE"
+
     # ------------------------ 合同与附件 ------------------------ #
     CONTRACT_NOT_FOUND = "CONTRACT_NOT_FOUND"
     FILE_NOT_FOUND = "FILE_NOT_FOUND"
@@ -143,6 +146,9 @@ ERROR_SPECS: dict[ErrorCode, ErrorSpec] = {
     ErrorCode.NOT_FOUND: ErrorSpec(404, ErrorCategory.USER_ERROR, "资源不存在"),
     ErrorCode.CONFLICT: ErrorSpec(409, ErrorCategory.USER_ERROR, "资源状态冲突"),
     ErrorCode.RATE_LIMITED: ErrorSpec(429, ErrorCategory.SYSTEM_ERROR, "请求过于频繁，请稍后重试"),
+    # -------------------------- 基础设施 -------------------------- #
+    # SYSTEM_ERROR ⇒ 可重试：数据库瞬时不可用属于基础设施故障，退避重试有意义
+    ErrorCode.DATABASE_UNAVAILABLE: ErrorSpec(503, ErrorCategory.SYSTEM_ERROR, "数据库暂时不可用"),
     # ------------------------ 合同与附件 ------------------------ #
     ErrorCode.CONTRACT_NOT_FOUND: ErrorSpec(404, ErrorCategory.USER_ERROR, "合同不存在"),
     ErrorCode.FILE_NOT_FOUND: ErrorSpec(404, ErrorCategory.USER_ERROR, "附件不存在"),
