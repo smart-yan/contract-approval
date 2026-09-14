@@ -1,10 +1,20 @@
-"""``upload_file`` 节点 —— 通过 Backend API 完成合同文件接入。
+"""``upload_file`` 节点 —— 编排"把合同文件接入系统"这一步。
 
-职责边界
--------
-本节点**不实现**任何文件校验（扩展名 / MIME / 魔数）、SHA256 计算、幂等判断、
-并发竞争处理或孤儿清理 —— 这些 Backend 在 P4 已经做完，并由 328 个测试覆盖。
-Agent 只做一件事：**把文件交给 Backend，再把结果翻译进 State**。
+调用链
+-----
+::
+
+    upload_file Node  →  ContractIngestTool  →  BackendClient  →  POST /api/v1/contracts
+    （编排）             （业务动作）            （HTTP）           （Backend）
+
+节点**只做编排**：把 State 翻译成 Tool 的输入、把 Tool 的输出写回 State。
+它不拼 multipart、不碰 httpx、不解析响应体 —— 那些是下面两层的职责。
+
+职责边界（架构红线）
+------------------
+本节点与它下面的两层都**不实现**：文件校验（扩展名 / MIME / 魔数）、SHA256 计算、
+幂等判断、并发竞争处理、孤儿清理。这些 Backend 在 P4 已经做完并有测试覆盖。
+Agent 只做一件事：**把文件交给 Backend，再把结果如实带回来**。
 
 失败为什么不抛异常
 ----------------
@@ -23,24 +33,12 @@ from langgraph.runtime import Runtime
 from app.core.errors import AgentErrorCode
 from app.graph.context import ReviewContext
 from app.graph.state import ContractReviewState
+from app.tools.contract_ingest import ContractIngestRequest, ContractIngestTool
 
 logger = logging.getLogger(__name__)
 
-#: 调用 Backend 之前必须齐备的输入。缺失说明调用方用错了 Graph，不必发请求
+#: 调用 Tool 之前必须齐备的输入。缺失说明调用方用错了 Graph，不必发请求
 _REQUIRED_INPUTS: tuple[str, ...] = ("file_path", "contract_no", "title", "contract_type")
-
-#: 从 Backend 响应里取出、写进 State 的字段。
-#: 只取后续节点真正要用的 —— 不把整个响应体倒进 State（State 不是响应缓存）。
-_PASSTHROUGH_FIELDS: tuple[str, ...] = (
-    "contract_id",
-    "file_id",
-    "review_task_id",
-    "sha256",
-    "file_type",
-    "file_size",
-    "reused",  # 文件层幂等
-    "task_reused",  # 任务层幂等
-)
 
 
 async def upload_file(
@@ -52,8 +50,8 @@ async def upload_file(
     * 读 State：``file_path`` / ``filename`` / ``content_type`` / ``contract_no`` /
       ``title`` / ``contract_type``
     * 写 State：``contract_id`` / ``file_id`` / ``review_task_id`` / ``sha256`` /
-      ``file_type`` / ``file_size`` / ``reused``，失败时写 ``error_code`` /
-      ``error_message``
+      ``file_type`` / ``file_size`` / ``reused`` / ``task_reused``，
+      失败时写 ``error_code`` / ``error_message``
     """
     missing = [name for name in _REQUIRED_INPUTS if not state.get(name)]
     if missing:
@@ -65,7 +63,7 @@ async def upload_file(
         }
 
     file_path = Path(state["file_path"])
-    outcome = await runtime.context.backend.upload_contract(
+    request = ContractIngestRequest(
         file_path=file_path,
         filename=state.get("filename") or file_path.name,
         content_type=state.get("content_type"),
@@ -74,24 +72,26 @@ async def upload_file(
         contract_type=state["contract_type"],
     )
 
-    if not outcome.ok or outcome.payload is None:
-        logger.warning(
-            "upload_file 失败 | status=%s code=%s message=%s",
-            outcome.status_code,
-            outcome.error_code,
-            outcome.error_message,
-        )
-        return {"error_code": outcome.error_code, "error_message": outcome.error_message}
+    # Tool 是无状态的薄封装，随用随建；HTTP 连接池由 ReviewContext 里的
+    # BackendClient 持有，不在这里创建
+    result = await ContractIngestTool(runtime.context.backend).run(request)
 
-    updates: dict[str, object] = {
-        key: outcome.payload[key] for key in _PASSTHROUGH_FIELDS if key in outcome.payload
-    }
+    if not result.ok:
+        logger.warning(
+            "upload_file 失败 | code=%s message=%s",
+            result.error_code,
+            result.error_message,
+        )
+        return {"error_code": result.error_code, "error_message": result.error_message}
+
+    updates = result.business_fields()
     logger.info(
-        "upload_file 完成 | contract_id=%s file_id=%s review_task_id=%s reused=%s",
+        "upload_file 完成 | contract_id=%s file_id=%s review_task_id=%s reused=%s task_reused=%s",
         updates.get("contract_id"),
         updates.get("file_id"),
         updates.get("review_task_id"),
         updates.get("reused"),
+        updates.get("task_reused"),
     )
     return updates
 
