@@ -13,7 +13,7 @@ from __future__ import annotations
 import pytest
 
 from app.core.constants import ClauseType, ExtractMethod
-from app.schemas.understanding import Clause, MetadataItem
+from app.schemas.understanding import Clause, KeywordHit, MetadataItem
 
 #: 与 ``backend/app/core/constants.py`` 的 ClauseType 一一对应
 EXPECTED_CLAUSE_TYPES = {
@@ -128,3 +128,33 @@ def test_every_metadata_field_has_a_label_and_a_value_type() -> None:
     for key, label, value_type in _FIELD_CATALOG:
         assert label, f"{key} 缺展示名"
         assert value_type in {"TEXT", "AMOUNT", "DATE", "CODE"}, f"{key} 的值类型越界"
+
+
+# --------------------------------------------------------------------------- #
+# KeywordHit（P7-3）
+# --------------------------------------------------------------------------- #
+#: P7-3 明确不加 match_text / count / weight / char_offset / category /
+#: is_risk / synonyms / confidence / task_id / DB ID
+EXPECTED_KEYWORD_HIT_FIELDS = {"term", "paragraph_index"}
+
+
+def test_keyword_hit_fields_are_frozen() -> None:
+    assert set(KeywordHit.model_fields) == EXPECTED_KEYWORD_HIT_FIELDS
+
+
+@pytest.mark.parametrize(
+    "forbidden",
+    [
+        "match_text",
+        "count",
+        "weight",
+        "char_offset",
+        "category",
+        "is_risk",
+        "synonyms",
+        "confidence",
+        "task_id",
+    ],
+)
+def test_keyword_hit_does_not_carry_out_of_scope_fields(forbidden: str) -> None:
+    assert forbidden not in KeywordHit.model_fields

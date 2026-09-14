@@ -32,7 +32,7 @@ from __future__ import annotations
 from typing import TypedDict
 
 from app.schemas.document import ParseResult
-from app.schemas.understanding import Clause, MetadataItem
+from app.schemas.understanding import Clause, KeywordHit, MetadataItem
 
 
 class ContractReviewState(TypedDict, total=False):
@@ -69,6 +69,7 @@ class ContractReviewState(TypedDict, total=False):
     # --------------------------- understanding -------------------------- #
     clauses: list[Clause]  # identify_clauses：条款切分结果
     metadata: list[MetadataItem]  # extract_metadata：从文档抽出的元数据项
+    keywords: list[KeywordHit]  # extract_keywords：主题词命中（不判断风险）
 
     # ------------------------------ failure ----------------------------- #
     error_code: str | None

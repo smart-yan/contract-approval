@@ -92,4 +92,22 @@ class MetadataItem(BaseModel):
     )
 
 
-__all__ = ["Clause", "MetadataItem"]
+class KeywordHit(BaseModel):
+    """一个主题词在某一段落里的命中。
+
+    刻意保持最小：只有"哪个词、在哪一段"。
+
+    **不加入**的东西及理由
+    --------------------
+    * ``match_text`` / ``count`` —— 要原文可以从 ``paragraphs[index].text`` 取；
+      ``count`` 是派生量（命中条数），多存一份就是多一个可能与命中列表不一致的真相源
+    * ``weight`` / ``category`` —— 第一版没有消费者（"按维度筛选"属 P11b）
+    * ``char_offset`` —— 沿用 P6-2 的位置契约，定位到段落即可
+    * ``is_risk`` / ``severity`` —— **关键词不判断风险**，那是 P8 规则引擎的事
+    """
+
+    term: str = Field(description="命中的词，取自 Agent 侧的受控词表 KEYWORD_LEXICON")
+    paragraph_index: int = Field(description="命中的段落序号")
+
+
+__all__ = ["Clause", "KeywordHit", "MetadataItem"]

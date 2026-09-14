@@ -2,6 +2,13 @@
 
 from app.schemas.document import Paragraph, ParseResult
 from app.schemas.review import ReviewRunResponse
-from app.schemas.understanding import Clause, MetadataItem
+from app.schemas.understanding import Clause, KeywordHit, MetadataItem
 
-__all__ = ["Clause", "MetadataItem", "Paragraph", "ParseResult", "ReviewRunResponse"]
+__all__ = [
+    "Clause",
+    "KeywordHit",
+    "MetadataItem",
+    "Paragraph",
+    "ParseResult",
+    "ReviewRunResponse",
+]

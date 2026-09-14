@@ -28,6 +28,9 @@
     extract_metadata
       │
       ▼
+    extract_keywords
+      │
+      ▼
     END（P8 起这里会接上 rule_review）
 
 ⚠️ **解析后的条件边不是冗余**：它把"解析失败就不该往下走"放在图的结构里。
@@ -59,6 +62,7 @@ from langgraph.graph.state import CompiledStateGraph
 
 from app.graph.context import ReviewContext
 from app.graph.edges.routing import route_after_parse, route_after_validate
+from app.graph.nodes.extract_keywords import extract_keywords
 from app.graph.nodes.extract_metadata import extract_metadata
 from app.graph.nodes.identify_clauses import identify_clauses
 from app.graph.nodes.parse_document import parse_document
@@ -73,6 +77,7 @@ NODE_VALIDATE_FILE = "validate_file"
 NODE_PARSE_DOCUMENT = "parse_document"
 NODE_IDENTIFY_CLAUSES = "identify_clauses"
 NODE_EXTRACT_METADATA = "extract_metadata"
+NODE_EXTRACT_KEYWORDS = "extract_keywords"
 
 # -------------------------- Conditional Edge -------------------------- #
 #: 分支名 → 真实目标（``END`` 是 langgraph 的结束哨兵，不是普通节点）
@@ -100,6 +105,7 @@ def build_review_graph() -> CompiledStateGraph:
     graph.add_node(NODE_PARSE_DOCUMENT, parse_document)
     graph.add_node(NODE_IDENTIFY_CLAUSES, identify_clauses)
     graph.add_node(NODE_EXTRACT_METADATA, extract_metadata)
+    graph.add_node(NODE_EXTRACT_KEYWORDS, extract_keywords)
 
     # ---- 主干 ----
     graph.add_edge(START, NODE_UPLOAD_FILE)
@@ -121,15 +127,17 @@ def build_review_graph() -> CompiledStateGraph:
 
     # ---- 理解层：三个能力互不依赖，都只吃 parse_result，顺序只是可读性选择 ----
     graph.add_edge(NODE_IDENTIFY_CLAUSES, NODE_EXTRACT_METADATA)
+    graph.add_edge(NODE_EXTRACT_METADATA, NODE_EXTRACT_KEYWORDS)
 
     # ---- 收尾 ----
-    graph.add_edge(NODE_EXTRACT_METADATA, END)
+    graph.add_edge(NODE_EXTRACT_KEYWORDS, END)
 
     return graph.compile()
 
 
 __all__ = [
     "CONDITIONAL_ROUTES",
+    "NODE_EXTRACT_KEYWORDS",
     "NODE_EXTRACT_METADATA",
     "NODE_IDENTIFY_CLAUSES",
     "NODE_PARSE_DOCUMENT",
