@@ -14,7 +14,7 @@ from app.core.errors import AgentErrorCode
 from app.parsers import PARSERS, parse_document_file, resolve_parser
 from app.parsers.base import DocumentParseError
 from app.parsers.docx_parser import DocxParser
-from tests.factories import save_docx
+from tests.factories import save_docx, soft_break_paragraph
 
 CHINESE_PARAGRAPHS = (
     "第一条 本合同由甲方与乙方于二〇二六年九月十四日签订。",
@@ -170,3 +170,79 @@ def test_text_is_always_the_join_of_paragraphs(tmp_path: Path) -> None:
     result = parse_document_file(path, file_type="DOCX")
 
     assert result.text == "\n".join(p.text for p in result.paragraphs)
+
+
+# --------------------------------------------------------------------------- #
+# block_type：段落 / 表格行由解析器显式标注，不从文本反推
+# --------------------------------------------------------------------------- #
+def test_plain_paragraph_is_marked_as_paragraph(tmp_path: Path) -> None:
+    path = save_docx(tmp_path / "p.docx", "第一条 合同标的", "正文段落")
+
+    result = parse_document_file(path, file_type="DOCX")
+
+    assert [p.block_type for p in result.paragraphs] == ["PARAGRAPH", "PARAGRAPH"]
+
+
+def test_table_rows_are_marked_as_table_row(tmp_path: Path) -> None:
+    path = save_docx(
+        tmp_path / "t.docx",
+        [["付款阶段", "比例"], ["预付款", "30%"]],
+    )
+
+    result = parse_document_file(path, file_type="DOCX")
+
+    assert [p.block_type for p in result.paragraphs] == ["TABLE_ROW", "TABLE_ROW"]
+
+
+def test_single_column_table_row_is_table_row_even_without_a_tab(tmp_path: Path) -> None:
+    """**这条就是不能用 ``\\t`` 反推的原因**：单列表格的行根本没有制表符。
+
+    如果靠"文本里有没有 \\t"判断，它会被当成普通段落 —— 而表格里的
+    「1. 预付款」正好会被条款识别误认成条款起点。
+    """
+    path = save_docx(tmp_path / "single.docx", [["1. 预付款"], ["2. 验收款"]])
+
+    result = parse_document_file(path, file_type="DOCX")
+
+    assert [p.block_type for p in result.paragraphs] == ["TABLE_ROW", "TABLE_ROW"]
+    assert "\t" not in result.text, "单列表格确实没有制表符 —— 靠它反推必错"
+    assert result.paragraphs[0].text == "1. 预付款"
+
+
+def test_block_types_keep_document_order(tmp_path: Path) -> None:
+    """段落与表格按文档顺序交错，block_type 必须跟着一起交错。"""
+    path = save_docx(
+        tmp_path / "mixed.docx",
+        "段一",
+        [["表一", "A"]],
+        "段二",
+        [["表二", "B"]],
+        "段三",
+    )
+
+    result = parse_document_file(path, file_type="DOCX")
+
+    assert [p.block_type for p in result.paragraphs] == [
+        "PARAGRAPH",
+        "TABLE_ROW",
+        "PARAGRAPH",
+        "TABLE_ROW",
+        "PARAGRAPH",
+    ]
+    assert [p.text for p in result.paragraphs] == ["段一", "表一\tA", "段二", "表二\tB", "段三"]
+
+
+def test_block_type_does_not_disturb_index_or_text_cleaning(tmp_path: Path) -> None:
+    """加了 block_type 之后，编号语义与清洗规则**一个字都没变**。"""
+    path = save_docx(
+        tmp_path / "stable.docx",
+        "  前后有空格  ",
+        "",
+        [["含\n换行的单元格", "B"]],
+        soft_break_paragraph("软", "换行"),
+    )
+
+    result = parse_document_file(path, file_type="DOCX")
+
+    assert [p.index for p in result.paragraphs] == [0, 1, 2, 3]
+    assert [p.text for p in result.paragraphs] == ["前后有空格", "", "含 换行的单元格\tB", "软 换行"]

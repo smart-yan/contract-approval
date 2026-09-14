@@ -213,6 +213,16 @@ def test_chinese_text_is_preserved_verbatim(tmp_path: Path) -> None:
     assert result.paragraphs[0].text == "金额：人民币壹拾万元整（¥100,000.00）"
 
 
+def test_every_paragraph_carries_a_block_type(tmp_path: Path) -> None:
+    """结构信息必须是**数据**，不能靠下游从文本猜（P7 条款识别依赖这点）。"""
+    path = save_docx(tmp_path / "bt.docx", "正文", [["表头", "值"]], "结尾")
+
+    result = _parse(path)
+
+    assert all(p.block_type in {"PARAGRAPH", "TABLE_ROW"} for p in result.paragraphs)
+    assert [p.block_type for p in result.paragraphs] == ["PARAGRAPH", "TABLE_ROW", "PARAGRAPH"]
+
+
 def test_failed_result_has_empty_text_and_paragraphs(tmp_path: Path) -> None:
     """失败时两个字段都空 —— 不变量 2 在失败路径上同样成立（空 join 空）。"""
     path = tmp_path / "broken.docx"

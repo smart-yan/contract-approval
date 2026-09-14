@@ -23,8 +23,14 @@
 
 这样 "``text`` 由 ``paragraphs`` 按顺序拼接" 这个不变量成立，P7 的定位也不会错位。
 
-⚠️ 已知取舍：表格行与普通段落在数据结构上不再可区分。**P6-1 刻意不做区分** ——
-要不要给它们不同的类型，取决于 P7 条款识别怎么用，现在决定就是猜。
+**段落还是表格行 —— 由解析器显式标注，不靠文本反推**
+--------------------------------------------------
+每条内容都带上 ``block_type``（``PARAGRAPH`` / ``TABLE_ROW``）。这个信息**在遍历的
+那一刻就在手上**（当前 child 是 ``w:p`` 还是 ``w:tbl``），丢掉它再去用"文本里有没有
+制表符"反推是退而求其次 —— **单列表格的行根本没有制表符**，反推必错。
+
+为什么下游需要它：合同表格里常出现「1. 预付款」这类**看起来像条款编号**的文本。
+如果没有结构标记，条款识别会把表格行当成条款起点，切出一堆假条款。
 
 文本清洗规则（P6-2 收口）
 ----------------------
@@ -64,6 +70,10 @@ from docx.text.paragraph import Paragraph as DocxParagraph
 from app.core.errors import AgentErrorCode
 from app.parsers.base import DocumentParseError, DocumentParser
 from app.schemas.document import Paragraph, ParseResult
+
+#: 段落块类型（与 Backend ``constants.BlockType`` 的取值一致）
+_BLOCK_PARAGRAPH = "PARAGRAPH"
+_BLOCK_TABLE_ROW = "TABLE_ROW"
 
 #: 表格行内单元格之间的连接符（制表符，与文本抽取工具的惯例一致）
 _CELL_SEPARATOR = "\t"
@@ -107,7 +117,8 @@ class DocxParser(DocumentParser):
             ) from exc
 
         paragraphs = [
-            Paragraph(index=i, text=text) for i, text in enumerate(self._iter_block_texts(document))
+            Paragraph(index=i, block_type=block_type, text=text)
+            for i, (block_type, text) in enumerate(self._iter_blocks(document))
         ]
         text = "\n".join(p.text for p in paragraphs)
 
@@ -120,18 +131,24 @@ class DocxParser(DocumentParser):
         )
 
     # ------------------------------------------------------------------ #
-    def _iter_block_texts(self, document: DocxDocument) -> Iterator[str]:
-        """按**文档顺序**产出正文段落与表格行的文本。
+    def _iter_blocks(self, document: DocxDocument) -> Iterator[tuple[str, str]]:
+        """按**文档顺序**产出 ``(block_type, text)``。
 
         顺序很关键：P7 要靠段落顺序还原"上下文"，乱序会让条款与金额对不上。
+
+        ``block_type`` 在这里是**免费**的 —— 循环变量 ``child`` 自己就说明了
+        这一条是段落还是表格。丢掉它再去猜，只会猜错。
         """
         for child in document.element.body.iterchildren():
             if child.tag == qn("w:p"):
-                yield normalize_text(DocxParagraph(child, document).text)
+                yield _BLOCK_PARAGRAPH, normalize_text(DocxParagraph(child, document).text)
             elif child.tag == qn("w:tbl"):
                 for row in Table(child, document).rows:
                     # 单元格先各自压成单行，再用 \t 拼接 —— 于是 \t 只可能是列边界
-                    yield _CELL_SEPARATOR.join(normalize_text(cell.text) for cell in row.cells)
+                    yield (
+                        _BLOCK_TABLE_ROW,
+                        _CELL_SEPARATOR.join(normalize_text(cell.text) for cell in row.cells),
+                    )
 
 
 __all__ = ["DocxParser", "normalize_text"]
