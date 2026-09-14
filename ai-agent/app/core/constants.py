@@ -40,6 +40,28 @@ class ClauseType(StrEnum):
     OTHER = "OTHER"
 
 
+class RuleType(StrEnum):
+    """规则求值器类型（P8-1 引入）。
+
+    ⚠️ **必须与 ``backend/app/core/constants.py`` 的 ``RuleType`` 保持一致。**
+
+    为什么 Agent 侧需要它：``AgentRule.rule_type`` 是**字符串**（Backend 的规则
+    目录可配置，收成枚举会让一条配置错的规则拖垮整份规则集），求值器拿这个枚举
+    做**分派**——两者分工不同：``str`` 负责"装得下任何值"，``StrEnum`` 负责
+    "我们认识哪几种"。因此 :class:`~app.rules.schemas.AgentRule` 里的
+    ``rule_type`` 是 ``str``，求值器里的比较对象是这里的成员。
+
+    ``StrEnum`` 成员是 ``str`` 子类，``"KEYWORD" == RuleType.KEYWORD`` 为真，
+    所以分派不需要把输入解析成枚举，**不认识的值自然落到"求值失败"分支**。
+    """
+
+    KEYWORD = "KEYWORD"  # 关键词命中
+    REGEX = "REGEX"  # 正则匹配
+    EXISTS = "EXISTS"  # 该条款必须存在
+    MISSING = "MISSING"  # 必备条款缺失
+    THRESHOLD = "THRESHOLD"  # 数值比较
+
+
 class ExtractMethod(StrEnum):
     """提取/切分方式。
 
@@ -56,4 +78,4 @@ class ExtractMethod(StrEnum):
     MANUAL = "MANUAL"  # 人工录入 / 修正
 
 
-__all__ = ["ClauseType", "ExtractMethod"]
+__all__ = ["ClauseType", "ExtractMethod", "RuleType"]
