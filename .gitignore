@@ -1,0 +1,57 @@
+# ===================== Python =====================
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+.coverage.*
+
+# ===================== 虚拟环境 =====================
+.venv/
+venv/
+env/
+ENV/
+
+# ===================== 依赖锁定 =====================
+# 注意：uv.lock 是版本锁定文件，必须提交，不要加入忽略列表
+# （此段仅作说明，无实际忽略规则）
+
+# ===================== 环境变量（含数据库密码，绝不提交）=====================
+.env
+.env.*
+!.env.example
+
+# ===================== 运行时文件 =====================
+backend/storage/*
+!backend/storage/.gitkeep
+
+# ===================== IDE / 编辑器 =====================
+.idea/
+.vscode/
+*.iml
+*.swp
+*~
+
+# ===================== 前端 =====================
+node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/*.local
+npm-debug.log*
+yarn-error.log*
+
+# ===================== 日志 =====================
+*.log
+logs/
+
+# ===================== 操作系统 =====================
+Thumbs.db
+Desktop.ini
+.DS_Store

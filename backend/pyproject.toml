@@ -1,0 +1,40 @@
+[project]
+name = "contract-approval-backend"
+version = "0.1.0"
+description = "合同审批审查系统 - 后端服务（FastAPI）"
+requires-python = ">=3.12"
+
+# P2 只声明「P2 运行所需」的依赖。
+# 后续阶段各自的依赖在各自阶段用 `uv add` 增量加入（P5 上传、P7 解析、P10 LLM ...），
+# 避免提前安装 P2 完全用不到的重型依赖（如 onnxruntime / playwright）。
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "sqlalchemy[asyncio]>=2.0.36",
+    "aiomysql>=0.2.0",
+    "alembic>=1.14",
+]
+
+# 开发工具链（不写测试代码，只保证工具可用）
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.28",
+    "ruff>=0.8",
+]
+
+# 应用项目，不作为 Python 包安装；从 backend/ 目录运行 uvicorn 即可
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
