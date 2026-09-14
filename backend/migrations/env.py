@@ -43,6 +43,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from app.core.config import get_settings
+from app.db import models  # noqa: F401  —— 导入即触发全部模型注册
 from app.db.base import Base, build_connect_args
 
 # Alembic 的 Config 对象（alembic.ini 的内容）
@@ -52,7 +53,9 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-#: autogenerate 的对比目标。P3 起新增模型会自动被纳入。
+#: autogenerate 的对比目标。
+#: ⚠️ 上面的 `from app.db import models` 不可删除 —— 模型必须被导入才会注册到
+#: `Base.metadata`，否则 autogenerate 会认为"没有任何表"，静默生成空迁移。
 target_metadata = Base.metadata
 
 settings = get_settings()

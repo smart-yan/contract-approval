@@ -97,13 +97,23 @@ def test_probe_table_is_not_registered_in_shared_metadata() -> None:
     assert "p2c_probe" not in Base.metadata.tables
 
 
-def test_no_business_tables_exist_yet() -> None:
-    """P2-c 范围守卫：数据库建模属于 P3，此刻 Base.metadata 必须为空。
+def test_business_tables_are_registered_by_p3_models() -> None:
+    """P3 起：``Base.metadata`` 由 ``app.db.models`` 注册的模型填充。
 
-    这个用例会在 P3 添加第一个模型时失败 —— 那是**预期**的，
-    届时应当把它改写为对具体表结构的断言，而不是直接删掉。
+    【本用例的前身是 P2-c 的 ``test_no_business_tables_exist_yet``】
+    那个守卫断言"P3 之前 Base.metadata 必须为空"，并**在 docstring 里预先声明**
+    它会在 P3 添加第一个模型时失败、届时应改写为对具体表结构的断言而非删除。
+    现在正是那一刻，故改写为下面的形式：
+
+    * ``app.db.models`` 是模型注册的唯一入口，必须能填充 metadata；
+    * 表清单的完整断言在 ``tests/unit/test_models_metadata.py``，
+      此处只守住"注册链路本身是通的"这一条，避免两个文件重复维护同一份表清单。
     """
-    assert Base.metadata.tables == {}, f"P3 之前不应有业务表，当前为 {list(Base.metadata.tables)}"
+    from app.db import models  # noqa: F401  确保注册入口被导入
+
+    assert Base.metadata.tables, "P3 之后 Base.metadata 不应为空 —— 模型注册链路断了"
+    assert "contract" in Base.metadata.tables
+    assert "review_task" in Base.metadata.tables
 
 
 def test_metadata_carries_naming_convention() -> None:

@@ -7,9 +7,18 @@
 
 范围纪律
 --------
-只登记**当前阶段或近期基础设施已有实际调用方**的枚举。远期模块
-（P4 认证、P5 接入、P9 规则引擎、P10 LLM、P12 回写）的枚举在进入对应阶段时
-按需追加 —— 避免"声明先行、无人使用"的维护噪声。
+只登记**当前阶段或近期基础设施已有实际调用方**的枚举。远期模块的枚举在进入对应
+阶段时按需追加 —— 避免"声明先行、无人使用"的维护噪声。
+
+P3 恢复的 6 个枚举（``RuleType`` / ``UserRole`` / ``SuggestionType`` /
+``ContractSource`` / ``AnchorMethod`` / ``LLMScene``）：
+它们在 P2-b 曾因"没有任何调用方"被收缩掉；P3 建立 ORM 模型后，这些枚举对应的
+**表列已经真实落地**（如 ``review_rule.rule_type``、``contract.source``），
+枚举重新获得了明确的调用方（模型字段的类型注解），因此按预定的"进入对应阶段时
+按需追加"原则恢复。
+
+> ⚠️ 恢复的**只是类型定义**。枚举背后的业务逻辑（规则引擎、认证、回写、LLM 调用）
+> 仍然未实现，分别属于 P9 / P4 / P12 / P10。
 
 实现约定
 --------
@@ -208,3 +217,76 @@ class BlockType(StrEnum):
     TABLE_ROW = "TABLE_ROW"
     HEADER = "HEADER"  # 页眉，归一化阶段会被剔除
     FOOTER = "FOOTER"  # 页脚，归一化阶段会被剔除
+
+
+# =========================================================================== #
+# 五、P3 随 ORM 建模恢复的枚举
+#
+# 这些枚举在 P2-b 因"无调用方"被收缩；P3 建表后其对应列已落地，故恢复。
+# 恢复的是类型定义，**不含**任何业务逻辑。
+# =========================================================================== #
+
+
+class RuleType(StrEnum):
+    """规则求值器类型（§7.2 review_rule.rule_type、§11.1）。
+
+    注意求值器本身（RuleEngine / evaluators）属于 P9，本阶段只登记类型。
+    """
+
+    KEYWORD = "KEYWORD"  # 关键词命中
+    REGEX = "REGEX"  # 正则匹配
+    EXISTS = "EXISTS"  # 该条款必须存在
+    MISSING = "MISSING"  # 必备条款缺失
+    THRESHOLD = "THRESHOLD"  # 数值比较
+
+
+class UserRole(StrEnum):
+    """用户角色（§2.4.2）。
+
+    ⚠️ ``sys_user`` 表属于 P4，本阶段**未创建**；此处仅恢复类型定义，
+    供 ``risk_item.reviewer_id`` 等"人工操作者"字段的语义参照使用。
+    """
+
+    LEGAL = "legal"  # 法务审查人
+    BIZ = "biz"  # 业务经办人
+    ADMIN = "admin"  # 系统管理员
+
+
+class SuggestionType(StrEnum):
+    """修改建议类型（§7.2 risk_suggestion.suggestion_type）。"""
+
+    REPLACE = "REPLACE"
+    ADD = "ADD"
+    DELETE = "DELETE"
+
+
+class ContractSource(StrEnum):
+    """合同来源（§7.2 contract.source）。"""
+
+    UPLOAD = "UPLOAD"  # 本地上传
+    APPROVAL_SYSTEM = "APPROVAL_SYSTEM"  # 从审批系统拉取
+
+
+class AnchorMethod(StrEnum):
+    """quote → 坐标的反查方式（§10.5 四级作用域，§7.2 risk_item.anchor_method）。
+
+    该字段既是前端展示依据（``anchor_score < 0.8`` 或 ``CLAUSE_FALLBACK`` 时
+    显示「⚠ 定位待核对」），也是 prompt 迭代的量化指标。
+    """
+
+    CLAUSE_SCOPED = "CLAUSE_SCOPED"  # L1：条款范围内命中（首选）
+    BLOCK_SCOPED = "BLOCK_SCOPED"  # L2：条款覆盖的 block 区间内命中
+    DOC_GLOBAL = "DOC_GLOBAL"  # L3：全文唯一命中
+    CLAUSE_FALLBACK = "CLAUSE_FALLBACK"  # L4：定位失败，降级为条款级 + 待核对
+
+
+class LLMScene(StrEnum):
+    """LLM 调用场景（§7.2 ai_call_log.scene、§9.1）。
+
+    ⚠️ LLM Provider 与调用链路属于 P10，本阶段只登记类型。
+    """
+
+    CLAUSE_REVIEW = "CLAUSE_REVIEW"  # 条款合规审查（核心）
+    METADATA_EXTRACT = "METADATA_EXTRACT"  # 元数据抽取兜底
+    SUGGESTION = "SUGGESTION"  # 修改建议生成
+    SUMMARY = "SUMMARY"  # 审查摘要生成
