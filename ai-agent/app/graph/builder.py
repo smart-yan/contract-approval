@@ -31,7 +31,10 @@
     extract_keywords
       │
       ▼
-    END（P8 起这里会接上 rule_review）
+    rule_review
+      │
+      ▼
+    END（P9 起这里会接上 LLM 审查与风险合并）
 
 ⚠️ **解析后的条件边不是冗余**：它把"解析失败就不该往下走"放在图的结构里。
 P7-1 接入第一个理解层节点时，只需要把 ``continue`` 指向 ``identify_clauses``，
@@ -66,6 +69,7 @@ from app.graph.nodes.extract_keywords import extract_keywords
 from app.graph.nodes.extract_metadata import extract_metadata
 from app.graph.nodes.identify_clauses import identify_clauses
 from app.graph.nodes.parse_document import parse_document
+from app.graph.nodes.rule_review import rule_review
 from app.graph.nodes.upload_file import upload_file
 from app.graph.nodes.validate_file import validate_file
 from app.graph.state import ContractReviewState
@@ -78,6 +82,7 @@ NODE_PARSE_DOCUMENT = "parse_document"
 NODE_IDENTIFY_CLAUSES = "identify_clauses"
 NODE_EXTRACT_METADATA = "extract_metadata"
 NODE_EXTRACT_KEYWORDS = "extract_keywords"
+NODE_RULE_REVIEW = "rule_review"
 
 # -------------------------- Conditional Edge -------------------------- #
 #: 分支名 → 真实目标（``END`` 是 langgraph 的结束哨兵，不是普通节点）
@@ -106,6 +111,7 @@ def build_review_graph() -> CompiledStateGraph:
     graph.add_node(NODE_IDENTIFY_CLAUSES, identify_clauses)
     graph.add_node(NODE_EXTRACT_METADATA, extract_metadata)
     graph.add_node(NODE_EXTRACT_KEYWORDS, extract_keywords)
+    graph.add_node(NODE_RULE_REVIEW, rule_review)
 
     # ---- 主干 ----
     graph.add_edge(START, NODE_UPLOAD_FILE)
@@ -129,8 +135,11 @@ def build_review_graph() -> CompiledStateGraph:
     graph.add_edge(NODE_IDENTIFY_CLAUSES, NODE_EXTRACT_METADATA)
     graph.add_edge(NODE_EXTRACT_METADATA, NODE_EXTRACT_KEYWORDS)
 
+    # ---- 规则审查：确定性规则求值（LLM 审查在 P9 之后接在它后面） ----
+    graph.add_edge(NODE_EXTRACT_KEYWORDS, NODE_RULE_REVIEW)
+
     # ---- 收尾 ----
-    graph.add_edge(NODE_EXTRACT_KEYWORDS, END)
+    graph.add_edge(NODE_RULE_REVIEW, END)
 
     return graph.compile()
 
@@ -141,6 +150,7 @@ __all__ = [
     "NODE_EXTRACT_METADATA",
     "NODE_IDENTIFY_CLAUSES",
     "NODE_PARSE_DOCUMENT",
+    "NODE_RULE_REVIEW",
     "NODE_UPLOAD_FILE",
     "NODE_VALIDATE_FILE",
     "PARSE_ROUTES",

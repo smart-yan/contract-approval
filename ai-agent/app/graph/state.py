@@ -6,8 +6,11 @@ State **不是数据库的副本**，只放"跨节点流转真正需要"的数�
 
 * SQLAlchemy ORM 对象 / 完整的 Contract / ReviewTask 对象
 * Backend 随时可以重新查询的事实（``task_status``、``task_stage``、合同详情……）
-* ``clauses`` / ``metadata`` / ``keywords`` / ``risks`` / ``suggestions`` / ``report``
-  —— 这些是后续阶段才增加的字段
+* ``suggestions`` / ``report`` —— 尚未实现的阶段才需要的字段，到那时再按需追加
+
+（``clauses`` / ``metadata`` / ``keywords`` 由 P7 加入，``rule_evaluations`` /
+``rule_risks`` 由 P8-2 加入 —— 每个字段都对应一个**已经存在的**节点产出，
+而不是为将来预留。）
 
 外部依赖（httpx client 等）同样**不在** State 里，它们走
 :class:`app.graph.context.ReviewContext` 注入。
@@ -24,6 +27,9 @@ input      调用方交给 Agent 的
 upload     ``upload_file`` 从 Backend 拿回来的（只保留后续节点真正要用的）
 validation ``validate_file`` 的结论，供 Conditional Edge 读取
 parse      ``parse_document`` 的产出
+understanding P7 三个能力各自的产出
+rules      ``rule_snapshot`` 是**输入**，``rule_evaluations`` / ``rule_risks`` 是
+           ``rule_review`` 的产出
 failure    失败信息，同样供 Conditional Edge 读取
 """
 
@@ -31,6 +37,7 @@ from __future__ import annotations
 
 from typing import TypedDict
 
+from app.rules.schemas import RuleEvaluationResult, RuleRisk, RuleSetSnapshot
 from app.schemas.document import ParseResult
 from app.schemas.understanding import Clause, KeywordHit, MetadataItem
 
@@ -70,6 +77,21 @@ class ContractReviewState(TypedDict, total=False):
     clauses: list[Clause]  # identify_clauses：条款切分结果
     metadata: list[MetadataItem]  # extract_metadata：从文档抽出的元数据项
     keywords: list[KeywordHit]  # extract_keywords：主题词命中（不判断风险）
+
+    # ------------------------------- rules ------------------------------ #
+    #: 本次审查使用的规则集快照 —— **输入**，由编排层放入（P8-2 下一步才是"从 Backend 取"）。
+    #: ⚠️ 它与"没有规则的合同类型"不是一回事：``None`` 表示规则快照根本没进 Workflow，
+    #: ``rule_review`` 会把它当**输入缺失**处理（写 ``error_code``）；
+    #: 而 ``RuleSetSnapshot(rule_set_version=None, rules=[])`` 是**正常结论**（空结论 + 无 error）
+    rule_snapshot: RuleSetSnapshot | None
+    #: rule_review：**每条规则一条**结论，顺序与 ``rule_snapshot.rules`` 一致。
+    #: 三态（MATCHED / NOT_MATCHED / EVALUATION_FAILED）原样保留 ——
+    #: "算不出来"因此始终可观察，不会被折叠进"没命中"
+    rule_evaluations: list[RuleEvaluationResult]
+    #: rule_review：命中产生的风险，按 ``rule_evaluations`` 顺序展平。
+    #: 元素就是 ``RuleRisk`` 本身（**不重新包装**），
+    #: 因此 ``paragraph_index`` / ``quote`` 等定位信息不会被搬运时丢掉
+    rule_risks: list[RuleRisk]
 
     # ------------------------------ failure ----------------------------- #
     error_code: str | None

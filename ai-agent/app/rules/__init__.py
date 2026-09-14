@@ -11,8 +11,9 @@
 这一层不认识 State、不认识 Graph、不发 HTTP（HTTP 在 ``app/tools``）——
 因此能脱离整张图单独测试。
 
-⚠️ P8-2 的进度：规则集快照契约（本模块）已完成；``rule_review`` 节点、
-把结果写进 State **仍未实现**。
+⚠️ P8-2 的进度：规则集快照契约（本模块）与 ``graphs/nodes/rule_review.py`` 的
+最小闭环已完成；**从 Backend 取规则**（谁把 ``rule_snapshot`` 放进 State）、
+LLM 审查、风险合并仍未实现。
 """
 
 from app.rules.catalog import RuleSnapshotError, snapshot_from_backend

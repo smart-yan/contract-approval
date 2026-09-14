@@ -23,10 +23,11 @@ class ReviewRunResponse(BaseModel):
     """一次合同审查编排的结果（Graph 结束时的状态投影）。"""
 
     workflow_status: Literal["completed", "rejected"] = Field(
-        description="本工作流是否产出了**可用的文档**。"
-        "completed = 上传通过且解析拿到了可用文档（PARSED 或 EMPTY）；"
-        "rejected = 三种情况之一：被 validate 门禁拦下、解析失败、或解析根本没跑过。"
-        "具体原因看 error_code —— status 只回答'有没有结果'，不回答'为什么没有'"
+        description="本工作流是否**成功走完且没有失败标记**。"
+        "completed = 上传通过 + 解析拿到了可用文档（PARSED 或 EMPTY）+ ``error_code`` 为空；"
+        "rejected = 其余情况：被 validate 门禁拦下、解析失败、解析根本没跑过，"
+        "或**后续节点判定失败**（如规则审查缺少规则快照这种输入缺失）。"
+        "具体原因看 error_code —— status 只回答'成没成功'，不回答'为什么没成功'"
     )
 
     # ---- 来自 Backend 的标识（失败时可能为空）----

@@ -19,8 +19,9 @@ Frontend 把文件交给 Agent，Agent 再转交给 Backend。中间这一跳必
 
 关于状态码
 ---------
-``200`` ⇔ 工作流**产出了可用文档**；其余一律 ``422``，具体原因在 ``error_code`` 里
-（取值见 ``AgentErrorCode``）。422 覆盖三种情况：被门禁拦下、解析失败、解析没跑过。
+``200`` ⇔ 工作流**成功产出且没有失败标记**；其余一律 ``422``，具体原因在 ``error_code`` 里
+（取值见 ``AgentErrorCode``）。422 覆盖：被门禁拦下、解析失败、解析没跑过，
+以及**后续节点判定失败**（如 ``rule_review`` 没拿到规则快照 —— 输入缺失）。
 
 状态码由 ``workflow_status`` 直接推导，**不单独判断** —— 否则会出现
 "上传成功但文档读不出来"被报成 200 的语义矛盾。
@@ -76,11 +77,24 @@ def _to_response(state: ContractReviewState) -> ReviewRunResponse:
 
     ``workflow_status`` 的判据
     ------------------------
-    **必须同时看门禁与解析**：只看 ``file_valid`` 会让"上传成功但文档读不出来"
-    被报成 ``completed`` —— 明明没产出任何可用内容，却说工作流完成了。
-    两个条件都成立才算 ``completed``，否则一律 ``rejected``（具体原因在 ``error_code``）。
+    三个条件**同时**成立才算 ``completed``：
+
+    1. ``error_code is None`` —— **State 里没有失败标记**
+    2. ``file_valid is True`` —— 门禁通过
+    3. 解析产出了可用文档（``has_usable_document``）
+
+    只看门禁与解析，会让"上传成功但文档读不出来"被报成 ``completed`` ——
+    明明没产出任何可用内容，却说工作流完成了。
+    而只看前两条，会让**后续节点**（如 ``rule_review``）判定失败时，
+    响应依旧是 ``completed + error_code`` 这种自相矛盾的组合。
+
+    ⚠️ 这一层只做 **projection**：失败是 State 已经判定好的事实
+    （哪个节点、为什么失败都在 ``error_code`` / ``error_message`` 里），
+    API 不去重新判断业务（例如"有没有规则快照"是 ``rule_review`` 的事）。
     """
-    succeeded = state.get("file_valid") is True and has_usable_document(state)
+    succeeded = (
+        state.get("error_code") is None and state.get("file_valid") is True and has_usable_document(state)
+    )
     return ReviewRunResponse(
         workflow_status="completed" if succeeded else "rejected",
         contract_id=state.get("contract_id"),

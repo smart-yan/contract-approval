@@ -28,6 +28,7 @@ import pytest
 from app.core.errors import AgentErrorCode
 from app.graph.builder import build_review_graph
 from app.graph.context import ReviewContext
+from app.rules.schemas import AgentRule, RuleSetSnapshot
 from app.tools.backend_client import BackendClient
 from tests.factories import docx_bytes
 
@@ -58,6 +59,25 @@ DOCX_PARAGRAPHS = ("甲方：某某科技有限公司", "第一条 本合同自�
 DOCX_BYTES = docx_bytes(*DOCX_PARAGRAPHS)
 
 Handler = Callable[[httpx.Request], Coroutine[Any, Any, httpx.Response]]
+
+#: 一份**合法**的 PURCHASE 规则集快照（与 seed 的规则同形，取 1 条即可）——
+#: 规则审查的合法前置输入，见 ``_initial_state`` 的说明。
+PURCHASE_SNAPSHOT = RuleSetSnapshot(
+    contract_type="PURCHASE",
+    rule_set_version="v1",
+    rules=[
+        AgentRule(
+            rule_code="IP_OWNER_SUPPLIER_001",
+            rule_name="知识产权归属相对方",
+            dimension="知识产权",
+            rule_type="KEYWORD",
+            expression={"keywords": ["知识产权归乙方"], "logic": "ANY"},
+            target_clause_types=["IP"],
+            severity="HIGH",
+            sort_order=10,
+        )
+    ],
+)
 
 
 @pytest.fixture
@@ -96,6 +116,10 @@ def _initial_state(source_file: Path) -> dict[str, Any]:
         "contract_no": "HT-2026-001",
         "title": "设备采购合同",
         "contract_type": "PURCHASE",
+        # 规则快照是规则审查的**合法前置输入**（P8-2）：没有它，
+        # ``rule_review`` 会按"输入缺失"判定失败，成功路径就不再成功。
+        # 走不到 rule_review 的用例带上它也无副作用。
+        "rule_snapshot": PURCHASE_SNAPSHOT,
     }
 
 
