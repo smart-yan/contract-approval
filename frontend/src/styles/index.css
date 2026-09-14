@@ -1,0 +1,37 @@
+/* 全局样式（壳工程）。
+ *
+ * 刻意保持极简：只做「让布局撑满视口」这类结构性设置，
+ * 不做视觉美化（P2-e 的目标是结构清晰、可扩展，不是最终产品级 UI）。
+ */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family:
+    'Helvetica Neue', Helvetica, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', Arial,
+    sans-serif;
+  font-size: 14px;
+  color: var(--el-text-color-primary);
+  background-color: var(--el-bg-color-page);
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: var(--el-color-primary);
+  text-decoration: none;
+}
+
+/* 页面内容的统一内边距 */
+.page-container {
+  padding: 16px;
+}

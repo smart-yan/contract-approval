@@ -1,0 +1,39 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# 环境变量文件
+#
+# 仓库根目录的 .gitignore 有一条 `.env.*` 规则，本意是保护**后端**含数据库密码的
+# backend/.env。但它会连带忽略前端的 VITE_* 配置 —— 而那些文件不含任何密钥，
+# 且是「新克隆仓库即可运行」所必需的（架构文档 §2.2 把 .env.development 列为工程文件）。
+#
+# 嵌套 .gitignore 的规则优先级高于上层，因此在这里显式放行**不含密钥**的环境文件。
+#
+# ⚠️ 只在此放行可公开的配置。`.env.local`（个人本地覆盖，可能含密钥）必须保持忽略 ——
+# 将来若某个环境文件含密钥，请单独忽略它，不要加到这个放行列表里。
+!.env.development
+!.env.production
+.env.local
+.env.*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
