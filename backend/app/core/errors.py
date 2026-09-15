@@ -103,6 +103,16 @@ class ErrorCode(StrEnum):
     #: ⚠️ 不覆盖、不追加 —— 已落库的风险可能已经带有人工复核结果
     TASK_ALREADY_PERSISTED = "TASK_ALREADY_PERSISTED"
 
+    # ------------------------ 文档层持久化（P10-1） ------------------------ #
+    #: 该任务的文档层结果（block/clause/metadata）已经写入过，拒绝重复写入
+    DOCUMENT_ALREADY_PERSISTED = "DOCUMENT_ALREADY_PERSISTED"
+    #: 附件复用块时，本次解析出的块结构与库里已有的对不上 ——
+    #: 按位置硬套会把条款挂到错误的块上，因此整批拒绝
+    DOCUMENT_BLOCKS_CONFLICT = "DOCUMENT_BLOCKS_CONFLICT"
+    #: 附件的解析状态已是终态（PARSED / FAILED），拒绝改写成另一个终态。
+    #: ⚠️ 同值重复写入是允许的（同一文件服务多个任务时必然发生）
+    PARSE_STATUS_ALREADY_FINAL = "PARSE_STATUS_ALREADY_FINAL"
+
     # ------------------------ 解析 / OCR ------------------------ #
     OCR_FAILED = "OCR_FAILED"
     OCR_LOW_QUALITY = "OCR_LOW_QUALITY"
@@ -175,6 +185,16 @@ ERROR_SPECS: dict[ErrorCode, ErrorSpec] = {
     ),
     ErrorCode.TASK_ALREADY_PERSISTED: ErrorSpec(
         409, ErrorCategory.USER_ERROR, "该任务的审查风险已写入，不允许重复写入或覆盖"
+    ),
+    # ------------------------ 文档层持久化（P10-1） ------------------------ #
+    ErrorCode.DOCUMENT_ALREADY_PERSISTED: ErrorSpec(
+        409, ErrorCategory.USER_ERROR, "该任务的文档结果已写入，不允许重复写入或覆盖"
+    ),
+    ErrorCode.DOCUMENT_BLOCKS_CONFLICT: ErrorSpec(
+        409, ErrorCategory.USER_ERROR, "该附件已有的文档块结构与本次解析结果不一致"
+    ),
+    ErrorCode.PARSE_STATUS_ALREADY_FINAL: ErrorSpec(
+        409, ErrorCategory.USER_ERROR, "附件的解析状态已是终态，不允许改写"
     ),
     # ------------------------ 解析 / OCR ------------------------ #
     ErrorCode.OCR_FAILED: ErrorSpec(422, ErrorCategory.SYSTEM_ERROR, "OCR 识别失败"),

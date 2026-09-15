@@ -90,11 +90,14 @@ def test_only_approved_business_routes_are_mounted(app: FastAPI) -> None:
     * P8-0  ``/api/v1/rule-sets``  —— 规则读取（只读，给 Agent 取规则用）
     * P9-10 ``/api/v1/review-tasks/{task_id}/risks`` —— 风险写入
       （Agent 合并后的最终风险整批落库，并把任务置为已审查）
+    * P10-1 ``/api/v1/review-tasks/{task_id}/document`` —— 文档层写入
+      （块 / 条款 / 元数据整批落库，并更新附件解析状态与任务阶段）
     """
     approved = {
         "/api/v1/contracts",
         "/api/v1/rule-sets",
         "/api/v1/review-tasks/{task_id}/risks",
+        "/api/v1/review-tasks/{task_id}/document",
     }
 
     paths = set(app.openapi()["paths"])
