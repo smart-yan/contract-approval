@@ -30,6 +30,7 @@ parse      ``parse_document`` 的产出
 understanding P7 三个能力各自的产出
 rules      ``rule_snapshot`` 是**输入**，``rule_evaluations`` / ``rule_risks`` 是
            ``rule_review`` 的产出
+llm        ``llm_findings`` 是 ``llm_review`` 的产出
 failure    失败信息，同样供 Conditional Edge 读取
 """
 
@@ -37,6 +38,7 @@ from __future__ import annotations
 
 from typing import TypedDict
 
+from app.llm.findings import LLMFinding
 from app.rules.schemas import RuleEvaluationResult, RuleRisk, RuleSetSnapshot
 from app.schemas.document import ParseResult
 from app.schemas.understanding import Clause, KeywordHit, MetadataItem
@@ -92,6 +94,14 @@ class ContractReviewState(TypedDict, total=False):
     #: 元素就是 ``RuleRisk`` 本身（**不重新包装**），
     #: 因此 ``paragraph_index`` / ``quote`` 等定位信息不会被搬运时丢掉
     rule_risks: list[RuleRisk]
+
+    # -------------------------------- llm ------------------------------- #
+    #: llm_review：模型报出的发现（P9-5）。
+    #: ⚠️ 它们是**模型的原始发现**，不是风险项 —— 还没做定位（P9-3/P9-4 的能力
+    #: 尚未接进节点）、没有 ``source`` 也没有最终段落号。
+    #: 与规则侧同理：模型跑失败时这里**保持缺失**，不写空列表
+    #: （空列表会被读成"模型看了，没发现问题"）
+    llm_findings: list[LLMFinding]
 
     # ------------------------------ failure ----------------------------- #
     error_code: str | None

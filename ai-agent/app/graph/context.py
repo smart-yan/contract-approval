@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from app.llm.provider import LLMProvider
 from app.tools.backend_client import BackendClient
 
 
@@ -27,6 +28,11 @@ class ReviewContext:
     """一次 Graph 运行所需的外部依赖。"""
 
     backend: BackendClient
+
+    #: LLM 提供方（P9-5 引入）。**可空**：不注入时 ``llm_review`` 节点会记录
+    #: 明确的 ``LLM_UNAVAILABLE`` 失败，而不是拿一个默认 provider 去悄悄发请求。
+    #: 测试注入一个 fake 即可离线跑完整条链路（与 ``backend`` 的注入方式一致）。
+    llm: LLMProvider | None = None
 
 
 __all__ = ["ReviewContext"]
