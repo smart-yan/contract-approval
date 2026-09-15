@@ -26,7 +26,16 @@ from app.llm.findings import ClauseReviewPromptInput
 
 #: ``clause_review`` 场景的当前提示版本 —— 同时也是文件名（不含扩展名）。
 #: 它会被写进 ``LLMRequest.prompt_version``，因此**改文件名就是改版本**。
+#:
+#: ⚠️ **v1 已停用但仍然留在仓库里**（这是本项目的规矩：改提示一律新建版本文件，
+#: 不覆盖旧的 —— 覆盖会让"历史任务当时用的是哪版提示"永远查不回来）。
+#: 它现在**跑不通**了：P9-8a 之后 finding 契约要求 ``dimension``，
+#: 而 v1 的正文里没有关于它的任何说明，模型不会输出该字段 → 校验必然失败。
+#: 想复现 v1 的行为，得同时回到当时的 finding 契约（去掉 dimension）。
 PROMPT_CLAUSE_REVIEW_V1 = "clause_review.v1"
+
+#: 当前版本：输出契约里增加了必填的 ``dimension``（P9-8a）。
+PROMPT_CLAUSE_REVIEW_V2 = "clause_review.v2"
 
 _PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
 
@@ -50,7 +59,7 @@ def render_clause_review_user_prompt(payload: ClauseReviewPromptInput) -> str:
     """把一批条款与已命中规则渲染成 **user prompt**。
 
     纯机械排版：怎么把结构化输入排成人能读（模型也能读）的文本。
-    **业务口径的措辞不在这里** —— 那是 ``clause_review.v1.md`` 的事。
+    **业务口径的措辞不在这里** —— 那是 ``prompts/clause_review.<版本>.md`` 的事。
 
     渲染是确定性的：同一份输入永远得到同一段文本（便于回归对比与排障）。
     """
@@ -79,6 +88,7 @@ def render_clause_review_user_prompt(payload: ClauseReviewPromptInput) -> str:
 
 __all__ = [
     "PROMPT_CLAUSE_REVIEW_V1",
+    "PROMPT_CLAUSE_REVIEW_V2",
     "load_prompt",
     "render_clause_review_user_prompt",
 ]

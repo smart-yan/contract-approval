@@ -83,6 +83,7 @@ PURCHASE_SNAPSHOT = RuleSetSnapshot(contract_type="PURCHASE", rule_set_version="
 #: 一份**合法**的模型输出
 GOOD_FINDING: dict[str, Any] = {
     "clause_index": 0,
+    "dimension": "知识产权",
     "risk_title": "知识产权归属供方",
     "risk_level": "HIGH",
     "reason": "成果归属供方会限制我方后续使用。",

@@ -51,6 +51,35 @@ RiskLevelLiteral = Literal["HIGH", "MEDIUM", "LOW"]
 #: ⚠️ Backend 侧新增取值时这里要同步 —— 它同时是"模型被允许输出的取值集合"。
 SuggestionTypeLiteral = Literal["REPLACE", "ADD", "DELETE"]
 
+#: **风险所属的审查维度**的固定词表（P9-8a 引入）。
+#:
+#: 取值**直接取自架构文档 §11.1 的「维度」列**（10 项）—— 不是在这里新造的：
+#: 那些名字在文档里与 ClauseType 并列出现过（如「知识产权 IP」「金额支付 AMOUNT_PAYMENT」），
+#: 并且当前 seed 的 3 条规则用的就是其中的 3 个。本步只是把**既有词表**写成了契约。
+#:
+#: ⚠️ **维度 ≠ 条款类型**：文档里「条款完备性」这一维度**没有**对应的 ClauseType
+#: （它说的是"必备条款缺失"这件事本身），足以说明两者不是一回事。
+#: 因此**绝不允许**用 ``clause_type`` 反推 dimension（那会把"争议管辖"变成 "DISPUTE"）。
+#:
+#: ⚠️ 已知窄口（如实记录，不在本步解决）：
+#: * 文档的 ``DELIVERY``（交付）条款类型**没有**对应的维度名 ——
+#:   若模型认为问题属于"交付"，它只能在现有 10 项里挑一个最接近的，或干脆不报
+#: * 规则侧的 ``dimension`` 在数据库里是**自由文本**（``String(32)``，无约束、无枚举），
+#:   管理员可以在规则目录里写一个不在这 10 项里的维度 —— 那时两侧的维度对不上，
+#:   合并（P9-9）按维度分桶时要考虑这个不对称
+RiskDimensionLiteral = Literal[
+    "主体资质",
+    "金额支付",
+    "违约责任",
+    "知识产权",
+    "争议管辖",
+    "保密",
+    "不可抗力",
+    "数据安全",
+    "验收",
+    "条款完备性",
+]
+
 
 # --------------------------------------------------------------------------- #
 # 模型输出（LLM Review 的 findings 契约）
@@ -79,6 +108,12 @@ class LLMFinding(BaseModel):
         ge=0,
         description="**范围标签**，必须原样回显输入里标注的条款编号。"
         "⚠️ 它不是最终坐标；Agent 会校验它是否越界，越界的 finding 直接丢弃",
+    )
+    dimension: RiskDimensionLiteral = Field(
+        description="**风险所属的审查维度**，只能取固定词表里的值（见 RiskDimensionLiteral）。"
+        "⚠️ 它与 ``clause_index`` 指向的**条款类型不是一回事**：维度说的是"
+        "「这属于哪一类审查关注点」，不是「它写在哪一条里」。"
+        "越界/自造的维度会被 schema 校验直接拒绝（P9-1 的严格校验，不做修复）",
     )
     risk_title: str = Field(min_length=1, description="风险标题（简短、可读，将作为风险卡片的标题）")
     risk_level: RiskLevelLiteral = Field(description="风险等级，只能取 HIGH / MEDIUM / LOW")
@@ -194,6 +229,7 @@ __all__ = [
     "LLMFinding",
     "LLMReviewResult",
     "MatchedRuleHint",
+    "RiskDimensionLiteral",
     "RiskLevelLiteral",
     "Suggestion",
     "SuggestionTypeLiteral",

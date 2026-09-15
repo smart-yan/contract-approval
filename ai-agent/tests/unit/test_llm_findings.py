@@ -23,6 +23,7 @@ from app.llm.findings import (
 def _finding(**overrides) -> LLMFinding:
     payload = {
         "clause_index": 3,
+        "dimension": "金额支付",
         "risk_title": "付款条款缺少验收前置条件",
         "risk_level": "HIGH",
         "reason": "付款义务先于验收，我方可能在未确认交付质量前即需付款。",
@@ -40,6 +41,7 @@ def _finding(**overrides) -> LLMFinding:
 def test_finding_has_exactly_the_agreed_fields() -> None:
     assert set(LLMFinding.model_fields) == {
         "clause_index",
+        "dimension",
         "risk_title",
         "risk_level",
         "reason",
@@ -87,10 +89,13 @@ def test_minimal_instantiation_uses_defaults() -> None:
 # --------------------------------------------------------------------------- #
 # 必填与约束
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("missing", ["clause_index", "risk_title", "risk_level", "reason", "quote"])
+@pytest.mark.parametrize(
+    "missing", ["clause_index", "dimension", "risk_title", "risk_level", "reason", "quote"]
+)
 def test_required_fields_are_enforced(missing: str) -> None:
     payload = {
         "clause_index": 3,
+        "dimension": "金额支付",
         "risk_title": "x",
         "risk_level": "HIGH",
         "reason": "y",
@@ -103,12 +108,107 @@ def test_required_fields_are_enforced(missing: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# dimension：固定词表（P9-8a）
+#
+# 词表取自架构文档 §11.1 的「维度」列 —— **不是这里新造的**。
+# --------------------------------------------------------------------------- #
+#: 与 ``RiskDimensionLiteral`` 一一对应的 10 个维度名（文档 §11.1）
+EXPECTED_DIMENSIONS = {
+    "主体资质",
+    "金额支付",
+    "违约责任",
+    "知识产权",
+    "争议管辖",
+    "保密",
+    "不可抗力",
+    "数据安全",
+    "验收",
+    "条款完备性",
+}
+
+
+def test_dimension_vocabulary_comes_from_the_document() -> None:
+    """维度词表**就是** §11.1 那 10 项 —— 不多不少（改它必须是有意的）。"""
+    from app.llm.findings import RiskDimensionLiteral
+
+    assert set(RiskDimensionLiteral.__args__) == EXPECTED_DIMENSIONS
+
+
+@pytest.mark.parametrize("dimension", sorted(EXPECTED_DIMENSIONS))
+def test_every_documented_dimension_passes(dimension: str) -> None:
+    assert _finding(dimension=dimension).dimension == dimension
+
+
+@pytest.mark.parametrize(
+    "dimension",
+    [
+        "IP",  # ⚠️ 条款类型，不是维度
+        "AMOUNT_PAYMENT",  # ⚠️ 同上
+        "知识产权归属",  # 自造词（词表里是「知识产权」）
+        "合同价款",  # 自造词
+        "OTHER",  # 自造词
+        "",  # 空
+        None,
+    ],
+)
+def test_invalid_dimension_is_rejected(dimension: object) -> None:
+    """越界/自造的维度被 schema 直接拒绝 —— **不改写成兜底值、不做修复**（P9-1 的语义）。"""
+    with pytest.raises(ValidationError):
+        _finding(dimension=dimension)
+
+
+def test_dimension_is_required() -> None:
+    """必填：模型不能"忘了"它 —— 缺了就是这一批不合契约（走降级）。"""
+    with pytest.raises(ValidationError):
+        LLMFinding(
+            clause_index=0,
+            risk_title="x",
+            risk_level="LOW",
+            reason="y",
+            quote="z",
+        )
+
+
+def test_json_guard_rejects_an_invented_dimension() -> None:
+    """走 **json_guard 的真实校验路径**：自造维度 → ``LLM_SCHEMA_INVALID``。
+
+    这是 P9-1 的严格语义在 P9-8a 上的落地：**不改成兜底值、不修复、不重试** ——
+    这一批直接降级（由 ``llm_review`` 节点翻译成 ``llm_error_code``）。
+    """
+    import json
+
+    from app.llm.json_guard import LLMSchemaInvalidError, parse_and_validate
+    from app.llm.schemas import LLMResult
+
+    raw = json.dumps(
+        {"findings": [dict(_finding(dimension="知识产权").model_dump(), dimension="知识产权归属")]},
+        ensure_ascii=False,
+    )
+
+    with pytest.raises(LLMSchemaInvalidError):
+        parse_and_validate(LLMReviewResult, LLMResult(raw_text=raw, model="m", provider="p"))
+
+
+def test_dimension_enum_is_visible_in_the_injected_schema() -> None:
+    """固定词表必须出现在注入提示的 JSON Schema 里 —— 模型才"看得到"可选值。
+
+    提示正文只说"从 schema 的枚举里选"，**不抄一遍列表**（抄本会漂移）。
+    """
+    instruction = json_guard.build_schema_instruction(LLMFinding)
+
+    for dimension in EXPECTED_DIMENSIONS:
+        assert f'"{dimension}"' in instruction
+
+
+# --------------------------------------------------------------------------- #
 # context_before / context_after：**Schema 硬约束**（最多 30 字，允许为空）
 #
 # 允许为空是必须的：quote 可能正好落在段落的开头或结尾，那里没有"紧邻的前文"。
 # --------------------------------------------------------------------------- #
 def test_context_fields_default_to_empty() -> None:
-    finding = LLMFinding(clause_index=0, risk_title="x", risk_level="LOW", reason="y", quote="z")
+    finding = LLMFinding(
+        clause_index=0, dimension="验收", risk_title="x", risk_level="LOW", reason="y", quote="z"
+    )
 
     assert finding.context_before == ""
     assert finding.context_after == ""
@@ -247,7 +347,14 @@ def test_matched_rule_hint_requires_a_rule_code() -> None:
 def test_json_schema_is_generated_from_the_model() -> None:
     schema = LLMFinding.model_json_schema()
 
-    assert schema["required"] == ["clause_index", "risk_title", "risk_level", "reason", "quote"]
+    assert schema["required"] == [
+        "clause_index",
+        "dimension",
+        "risk_title",
+        "risk_level",
+        "reason",
+        "quote",
+    ]
     assert schema["properties"]["risk_level"]["enum"] == ["HIGH", "MEDIUM", "LOW"]
     assert schema["properties"]["context_before"]["maxLength"] == 30, "长度上限必须出现在注入提示的 schema 里"
     assert schema["properties"]["context_after"]["maxLength"] == 30

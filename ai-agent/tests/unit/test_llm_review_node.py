@@ -61,6 +61,7 @@ DOCUMENT = (
 #: 一份**合法**的模型输出（顶层必须是对象，见 P9-2 的契约）
 GOOD_FINDING: dict[str, Any] = {
     "clause_index": 0,
+    "dimension": "知识产权",
     "risk_title": "知识产权归属相对方",
     "risk_level": "HIGH",
     "reason": "成果归属供方会限制我方后续使用。",
@@ -353,7 +354,7 @@ async def test_request_uses_the_versioned_prompt_and_schema() -> None:
     await _run(_state(), provider)
 
     request = provider.requests[0]
-    assert request.prompt_version == "clause_review.v1"
+    assert request.prompt_version == "clause_review.v2"
     assert request.output_schema is LLMReviewResult
     assert "不得编造条款" in request.system_prompt, "业务口径的提示来自版本化文件"
 

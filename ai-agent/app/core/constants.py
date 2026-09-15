@@ -62,6 +62,22 @@ class RuleType(StrEnum):
     THRESHOLD = "THRESHOLD"  # 数值比较
 
 
+class RiskSource(StrEnum):
+    """风险来源（P9-8 引入）。
+
+    ⚠️ **必须与 ``backend/app/core/constants.py`` 的 ``RiskSource`` 保持一致**
+    （第 5 个跨服务枚举副本）。注意 ``RULE_AND_LLM`` 的**字面值是 ``"RULE+LLM"``** ——
+    与架构文档 §7.2 的写法一致，不要"顺手改成下划线"。
+
+    谁产出它：**Agent**。两个映射函数分别产出 :attr:`RULE` 与 :attr:`LLM`；
+    :attr:`RULE_AND_LLM` 只在**合并**之后出现（合并是后续步骤，本轮不产出它）。
+    """
+
+    RULE = "RULE"
+    LLM = "LLM"
+    RULE_AND_LLM = "RULE+LLM"  # 字面值与架构文档 §7.2 / Backend 保持一致
+
+
 class LLMScene(StrEnum):
     """LLM 调用场景（P9-1 引入）。
 
@@ -100,4 +116,4 @@ class ExtractMethod(StrEnum):
     MANUAL = "MANUAL"  # 人工录入 / 修正
 
 
-__all__ = ["ClauseType", "ExtractMethod", "LLMScene", "RuleType"]
+__all__ = ["ClauseType", "ExtractMethod", "LLMScene", "RiskSource", "RuleType"]

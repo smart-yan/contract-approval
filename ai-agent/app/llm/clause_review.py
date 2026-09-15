@@ -20,7 +20,7 @@
 不认识文档结构（定位是 P9-3 的事）。它负责的是**业务决定**：
 
 * 用哪个场景（``LLMScene.CLAUSE_REVIEW``）与哪个提示版本
-* 提示正文从哪里读（``prompts/clause_review.v1.md``）
+* 提示正文从哪里读（``prompts/clause_review.v2.md``，版本即文件名）
 * 输出契约声明成什么（``LLMReviewResult``）—— 它同时决定注入提示的 schema
 * 把三层的产物拼成一个可消费的结果
 
@@ -45,7 +45,7 @@ from typing import cast
 from app.core.constants import LLMScene
 from app.llm.findings import ClauseReviewPromptInput, LLMReviewResult
 from app.llm.json_guard import parse_and_validate
-from app.llm.prompts import PROMPT_CLAUSE_REVIEW_V1, load_prompt, render_clause_review_user_prompt
+from app.llm.prompts import PROMPT_CLAUSE_REVIEW_V2, load_prompt, render_clause_review_user_prompt
 from app.llm.provider import LLMProvider
 from app.llm.schemas import LLMRequest, LLMResult
 
@@ -81,7 +81,7 @@ class ClauseReviewOutcome:
 def build_clause_review_request(
     payload: ClauseReviewPromptInput,
     *,
-    prompt_version: str = PROMPT_CLAUSE_REVIEW_V1,
+    prompt_version: str = PROMPT_CLAUSE_REVIEW_V2,
 ) -> LLMRequest:
     """把一次审查的输入组织成 :class:`LLMRequest`（**不发起任何调用**）。
 
@@ -107,7 +107,7 @@ async def review_clauses(
     provider: LLMProvider,
     payload: ClauseReviewPromptInput,
     *,
-    prompt_version: str = PROMPT_CLAUSE_REVIEW_V1,
+    prompt_version: str = PROMPT_CLAUSE_REVIEW_V2,
 ) -> ClauseReviewOutcome:
     """跑一次"条款审查"调用：组织请求 → 调用模型 → 校验结构化输出。
 

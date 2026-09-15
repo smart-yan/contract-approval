@@ -39,6 +39,7 @@ def _document(*texts: str) -> tuple[ParseResult, list[Clause]]:
 def _finding(**overrides) -> LLMFinding:
     payload = {
         "clause_index": 0,
+        "dimension": "知识产权",
         "risk_title": "知识产权归属相对方",
         "risk_level": "HIGH",
         "reason": "成果归属供方会限制我方后续使用。",
@@ -177,6 +178,30 @@ def test_quote_in_another_clause_is_not_stolen() -> None:
 
     assert resolved.anchor_method == ANCHOR_CLAUSE_FALLBACK
     assert resolved.paragraph_index <= clauses[0].end_paragraph_index
+
+
+# --------------------------------------------------------------------------- #
+# dimension 随 finding 一起保留（P9-8a）
+# --------------------------------------------------------------------------- #
+def test_dimension_survives_resolution() -> None:
+    """落地解析**只加位置、不动结论** —— 维度原样跟着 finding 走。
+
+    （P9-4 的定位规则一行未改：它不读、也不改写 ``finding`` 里的任何字段。）
+    """
+    parsed, clauses = _document(*DOCUMENT)
+
+    (resolved,) = _resolve(parsed, clauses, [_finding(dimension="知识产权")])
+
+    assert resolved.finding.dimension == "知识产权"
+
+
+def test_resolution_does_not_derive_a_dimension() -> None:
+    """即使命中的是 IP 条款，也不许把维度改写成与条款类型相关的东西。"""
+    parsed, clauses = _document(*DOCUMENT)
+
+    (resolved,) = _resolve(parsed, clauses, [_finding(dimension="条款完备性")])
+
+    assert resolved.finding.dimension == "条款完备性", "维度是模型给的，不是从 clause_type 推的"
 
 
 # --------------------------------------------------------------------------- #

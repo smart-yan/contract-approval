@@ -12,6 +12,7 @@ from app.llm.findings import ClauseContext, ClauseReviewPromptInput, MatchedRule
 from app.llm.json_guard import build_schema_instruction
 from app.llm.prompts import (
     PROMPT_CLAUSE_REVIEW_V1,
+    PROMPT_CLAUSE_REVIEW_V2,
     load_prompt,
     render_clause_review_user_prompt,
 )
@@ -92,6 +93,99 @@ def test_unknown_prompt_version_fails_loudly() -> None:
     """版本不存在是**打包/部署错误** —— 必须响亮失败，不能回落成空提示。"""
     with pytest.raises(FileNotFoundError):
         load_prompt("clause_review.v99")
+
+
+# --------------------------------------------------------------------------- #
+# v2：因为输出契约多了 dimension，提示必须升级（P9-8a）
+# --------------------------------------------------------------------------- #
+def test_current_version_is_v2() -> None:
+    """输出契约变了，提示版本必须跟着变 —— 否则"历史任务用的哪版提示"就说不清。"""
+    from app.llm.clause_review import build_clause_review_request
+
+    payload = ClauseReviewPromptInput(contract_type="PURCHASE", clauses=CLAUSES)
+
+    assert PROMPT_CLAUSE_REVIEW_V2 == "clause_review.v2"
+    assert build_clause_review_request(payload).prompt_version == "clause_review.v2"
+
+
+def test_v1_is_kept_but_documented_as_incompatible() -> None:
+    """v1 **不删**（历史留痕），但它是跑不通的：正文里没提 dimension，模型不会输出它。"""
+    from app.llm.prompts import PROMPT_CLAUSE_REVIEW_V1
+
+    v1 = load_prompt(PROMPT_CLAUSE_REVIEW_V1)
+
+    assert v1, "旧版本要留着"
+    assert "dimension" not in v1, "v1 里没有 dimension 的说明 —— 因此它与新契约不兼容"
+
+
+@pytest.mark.parametrize(
+    ("constraint", "why"),
+    [
+        ("dimension", "必须提到这个字段"),
+        ("审查维度", "必须说明它是**风险所属的审查维度**"),
+        ("条款类型", "必须说明它与条款类型**不是一回事**"),
+        ("固定候选集合", "必须说明只能从固定候选集合里选"),
+        ("不要创造", "必须明令禁止创造集合外的取值"),
+    ],
+)
+def test_v2_states_the_dimension_rules(constraint: str, why: str) -> None:
+    assert constraint in load_prompt(PROMPT_CLAUSE_REVIEW_V2), why
+
+
+def test_v2_points_at_the_schema_for_the_candidate_set() -> None:
+    """候选集合**不在提示里抄一遍** —— 指向注入的 JSON Schema 的枚举。
+
+    抄一份列表就是第二份真相源：schema 改了、抄本没改，而模型会照着错的那份选。
+    """
+    text = load_prompt(PROMPT_CLAUSE_REVIEW_V2)
+    from app.llm.findings import RiskDimensionLiteral
+
+    assert "JSON Schema" in text and "枚举" in text
+    assert '"enum"' not in text, "不许把 schema 片段抄进来"
+
+    # 「抄一份列表」的形态：同一行里排出**三个以上**维度名。
+    # （正文里单独用某个维度的词来解释含义是正常的，不算抄列表。）
+    for line in text.splitlines():
+        present = [d for d in RiskDimensionLiteral.__args__ if d in line]
+        assert len(present) < 3, f"这一行列了 {len(present)} 个候选值，像是把枚举抄进来了：{line}"
+
+
+def test_v2_does_not_hand_the_model_a_near_miss_value() -> None:
+    """⚠️ 提示里**不许出现"看起来像取值、其实不是"**的词。
+
+    写提示时踩过一次：原本的例子写成「例如：知识产权归属、违约责任的轻重」——
+    那读起来就是一份可选值清单，模型照着回一个"知识产权归属"，校验直接拒整批。
+    """
+    text = load_prompt(PROMPT_CLAUSE_REVIEW_V2)
+    from app.llm.findings import RiskDimensionLiteral
+
+    for dimension in RiskDimensionLiteral.__args__:
+        # 维度全称不能作为**独立词条**出现在括号举例里（`例如：X、Y`）那种形态
+        assert f"例如：{dimension}" not in text
+        assert f"、{dimension}、" not in text
+
+
+def test_v2_forbids_forcing_a_dimension() -> None:
+    """必填字段**不构成**「必须报点什么」的压力（P9-8a 架构审查的返工点）。
+
+    原先的正文写的是「填不出合适的维度时，选一个语义上最接近的候选值」——
+    那是在证据不足时鼓励模型强行归类，与「dimension 不许猜、不许兜底」的口径冲突。
+    必填字段的正确逃生口是**不报这条 finding**，而不是硬填一个。
+    """
+    text = load_prompt(PROMPT_CLAUSE_REVIEW_V2)
+
+    assert "最接近" not in text, "不许再出现「挑一个最接近的」这类措辞"
+    assert "不要报这条" in text, "必须给出逃生口：证据支持不了任何候选维度时不报"
+    assert "硬填" in text, "要点明：必填 ≠ 可以硬填"
+
+
+def test_v2_binds_the_choice_to_the_evidence() -> None:
+    """选择依据只能是**证据**，不能是关键词、字面相似或条款类型。"""
+    text = load_prompt(PROMPT_CLAUSE_REVIEW_V2)
+
+    assert "风险证据本身" in text, "必须把选择依据钉在证据上"
+    for excuse in ("字面相似", "条款类型"):
+        assert excuse in text, f"必须点名禁止这种凑法：{excuse}"
 
 
 def test_business_rules_stay_out_of_the_schema_instruction() -> None:

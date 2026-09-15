@@ -31,7 +31,7 @@ from app.llm.findings import (
     MatchedRuleHint,
 )
 from app.llm.json_guard import LLMSchemaInvalidError
-from app.llm.prompts import PROMPT_CLAUSE_REVIEW_V1
+from app.llm.prompts import PROMPT_CLAUSE_REVIEW_V2
 from app.llm.provider import DeepSeekProvider, LLMProvider, LLMUnavailableError
 from app.llm.schemas import LLMRequest, LLMResult
 
@@ -61,6 +61,7 @@ MATCHED = [
 #: 一份**合法**的模型输出（顶层是对象，见 P9-2 的契约）
 GOOD_FINDING: dict[str, Any] = {
     "clause_index": 3,
+    "dimension": "金额支付",
     "risk_title": "付款条款缺少验收前置条件",
     "risk_level": "HIGH",
     "reason": "付款义务先于验收，我方可能在未确认交付质量前即需付款。",
@@ -127,7 +128,7 @@ def test_request_carries_the_scene_and_prompt_version() -> None:
     request = build_clause_review_request(_payload())
 
     assert request.scene == LLMScene.CLAUSE_REVIEW
-    assert request.prompt_version == PROMPT_CLAUSE_REVIEW_V1
+    assert request.prompt_version == PROMPT_CLAUSE_REVIEW_V2
     assert request.output_schema is LLMReviewResult
 
 
@@ -155,9 +156,9 @@ def test_request_user_prompt_carries_clauses_and_rule_codes() -> None:
 
 
 def test_request_uses_an_explicit_prompt_version() -> None:
-    request = build_clause_review_request(_payload(), prompt_version=PROMPT_CLAUSE_REVIEW_V1)
+    request = build_clause_review_request(_payload(), prompt_version=PROMPT_CLAUSE_REVIEW_V2)
 
-    assert request.prompt_version == "clause_review.v1", "版本会进 ai_call_log 与幂等键"
+    assert request.prompt_version == "clause_review.v2", "版本会进 ai_call_log 与幂等键"
 
 
 def test_unknown_prompt_version_fails_loudly_and_never_calls_the_model() -> None:
@@ -198,7 +199,7 @@ async def test_review_passes_the_built_request_to_the_provider() -> None:
     assert len(provider.requests) == 1, "只调用一次（本步不做重试）"
     sent = provider.requests[0]
     assert sent.scene == LLMScene.CLAUSE_REVIEW
-    assert sent.prompt_version == PROMPT_CLAUSE_REVIEW_V1
+    assert sent.prompt_version == PROMPT_CLAUSE_REVIEW_V2
     assert sent.output_schema is LLMReviewResult
     assert "条款 #3" in sent.user_prompt
 
