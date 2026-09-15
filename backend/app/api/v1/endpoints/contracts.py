@@ -24,8 +24,9 @@ from fastapi import APIRouter, File, Form, Response, UploadFile, status
 from app.core.constants import ContractType
 from app.core.errors import AppError, ErrorCode
 from app.core.logging import get_logger
-from app.schemas.contract import ContractIngestResponse
+from app.schemas.contract import ContractIngestResponse, ContractListItem
 from app.services.contract_ingest import ContractMeta, ingest_contract
+from app.services.contract_query import list_contracts as list_contracts_service
 from app.storage import get_storage
 from app.utils.file_utils import MAX_UPLOAD_SIZE_BYTES, normalize_extension
 
@@ -35,6 +36,31 @@ router = APIRouter(tags=["contracts"])
 
 #: 落盘时的读取块大小（1 MiB）
 UPLOAD_CHUNK_SIZE = 1024 * 1024
+
+
+@router.get(
+    "/contracts",
+    response_model=list[ContractListItem],
+    summary="列出全部合同及其最新审查任务",
+    responses={
+        200: {
+            "description": "查询成功。**没有任何合同时返回空数组**，不是 404 —— "
+            "集合查询的空结果是一次成功查询"
+        },
+    },
+)
+async def list_contracts() -> list[ContractListItem]:
+    """合同列表（P11-3）。按 ``created_at DESC, id DESC`` 稳定排序。
+
+    ⚠️ 每项的进度信号取自 **``latest_task.current_stage``**，不是
+    ``contract.status`` / ``contract.current_task_id`` —— 后两者在 P4 之后
+    就没有被维护过（见 ``app/schemas/contract.py`` 的说明）。
+
+    本接口**不分页、不筛选**：MVP 的合同量很小，加分页只会带来分页器 UI
+    与"翻页时数据变了"的一致性成本，没有对应的收益。真要加时按 ``id`` 做
+    keyset 分页（``?before_id=``），而不是 offset。
+    """
+    return await list_contracts_service()
 
 
 async def _stream_upload_to_temp(upload: UploadFile, temp_path: Path) -> int:

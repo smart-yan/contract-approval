@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from pydantic import BaseModel, Field
 
 
@@ -48,4 +50,50 @@ class ContractIngestResponse(BaseModel):
     )
 
 
-__all__ = ["ContractIngestResponse"]
+# =========================================================================== #
+# 合同查询（P11-3）
+# =========================================================================== #
+class ReviewTaskSummary(BaseModel):
+    """列表项里的**最新任务摘要**。
+
+    ⚠️ 为什么列表状态不能取 ``Contract.status`` / ``Contract.current_task_id``：
+    那两个字段在 P4 建合同时写下后就**没人再维护**（``status`` 恒为建库时的值、
+    ``current_task_id`` 恒为 ``NULL``），拿它们当状态来源会显示一个陈旧的事实。
+    真正的进度信号在 ``review_task.current_stage`` —— 它由文档层与风险层真实推进。
+    """
+
+    task_id: int = Field(description="审查任务 ID（点进工作台要用它）")
+    status: str = Field(description="任务状态，取值见 constants.TaskStatus")
+    current_stage: str = Field(
+        description="阶段级断点标记，取值见 constants.TaskStage。"
+        "**这才是当前可用的进度信号**（``status`` 目前恒为 pending）"
+    )
+    progress: int = Field(
+        ge=0,
+        le=100,
+        description="进度百分比。⚠️ 由 ``current_stage`` **推导**，不是数据库里那一列 —— "
+        "``review_task.progress`` 从来没有被更新过（恒为 0）。映射见 services/contract_query.py",
+    )
+
+
+class ContractListItem(BaseModel):
+    """合同列表的一项。
+
+    ``latest_task`` 为 ``None`` 表示**这个合同还没有任何审查任务** ——
+    不伪造一个默认任务，前端据此显示"尚未发起审查"。
+    """
+
+    contract_id: int = Field(description="合同 ID")
+    contract_no: str = Field(description="合同编号")
+    title: str = Field(description="合同名称")
+    contract_type: str = Field(description="合同类型，取值见 constants.ContractType")
+    created_at: datetime = Field(
+        description="入库时刻。⚠️ **naive UTC**（项目统一存 UTC，不带时区偏移）—— "
+        "前端展示时需要自行按本地时区换算，不要直接当本地时间用"
+    )
+    latest_task: ReviewTaskSummary | None = Field(
+        default=None, description="该合同下 id 最大的审查任务；没有任务时为 null"
+    )
+
+
+__all__ = ["ContractIngestResponse", "ContractListItem", "ReviewTaskSummary"]

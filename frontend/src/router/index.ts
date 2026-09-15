@@ -1,14 +1,18 @@
 /**
  * 路由配置（架构文档 §2.2 router/index.ts）。
  *
- * 本阶段（P2-e）**只有壳路由**：
- *   /            → Layout（重定向到 /dashboard）
- *   /dashboard   → 审查大盘占位页
- *   /404         → 404 页面
- *   /:pathMatch  → 兜底到 404
+ * 路由演进：
+ *   P2-e  /                  → Layout（重定向到 /dashboard）
+ *         /dashboard         → 审查大盘壳工程占位页
+ *   P11-5 /contracts         → 合同列表（真实业务页面，取 Backend 的 /api/v1/contracts）
+ *         /review-tasks/:taskId/workbench → 审查工作台（P11-6 骨架 + P11-7 风险定位）
+ *   其它  /404、/:pathMatch  → 兜底 404
  *
- * ⚠️ 刻意不创建 /contracts、/reviews、/rules、/tasks、/reports 等业务路由。
- * 角色守卫（架构文档里提到的 "路由 + 角色守卫"）属于 P4 认证阶段，本阶段不做。
+ * ⚠️ 仍然刻意没有 /reviews、/rules、/tasks、/reports —— 它们对应的页面还不存在。
+ * 新增业务路由时请同步更新 ``tests/unit/router.spec.ts`` 的白名单守卫
+ * （它把这批路径钉死，防止有人未经裁决就往里加页面）。
+ *
+ * 角色守卫（架构文档里提到的 "路由 + 角色守卫"）属于 P4 认证阶段，仍未做。
  */
 import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
 
@@ -27,7 +31,23 @@ export const routes: RouteRecordRaw[] = [
         component: () => import('@/views/dashboard/DashboardView.vue'),
         meta: { title: '审查大盘' },
       },
+      {
+        // P11-5：合同列表。数据来自 Backend 的 GET /api/v1/contracts（走 vite 的 /api 代理）
+        path: 'contracts',
+        name: 'contracts',
+        component: () => import('@/views/contracts/ContractListView.vue'),
+        meta: { title: '合同列表' },
+      },
     ],
+  },
+  {
+    // P11-5：工作台路由。合同列表的「查看审查」跳到这里。
+    // 页面自身在 P11-6（骨架：任务/合同/文件/条款/元数据/风险/原文）与
+    // P11-7（风险卡片 → paragraph_index → 滚动高亮）落地。
+    path: '/review-tasks/:taskId/workbench',
+    name: 'workbench',
+    component: () => import('@/views/workbench/WorkbenchView.vue'),
+    meta: { title: '审查工作台' },
   },
   {
     path: '/404',

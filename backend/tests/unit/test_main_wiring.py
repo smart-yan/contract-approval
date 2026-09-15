@@ -92,12 +92,16 @@ def test_only_approved_business_routes_are_mounted(app: FastAPI) -> None:
       （Agent 合并后的最终风险整批落库，并把任务置为已审查）
     * P10-1 ``/api/v1/review-tasks/{task_id}/document`` —— 文档层写入
       （块 / 条款 / 元数据整批落库，并更新附件解析状态与任务阶段）
+    * P11-4 ``/api/v1/review-tasks/{task_id}/workbench`` —— 工作台查询
+      （一次取齐合同 / 原文 / 条款 / 元数据 / 风险；P11-3 的 ``/api/v1/contracts``
+      是同一个路径上新增的 GET，白名单按**路径**比较，因此不受影响）
     """
     approved = {
         "/api/v1/contracts",
         "/api/v1/rule-sets",
         "/api/v1/review-tasks/{task_id}/risks",
         "/api/v1/review-tasks/{task_id}/document",
+        "/api/v1/review-tasks/{task_id}/workbench",
     }
 
     paths = set(app.openapi()["paths"])

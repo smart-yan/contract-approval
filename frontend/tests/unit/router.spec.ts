@@ -47,16 +47,45 @@ describe('路由配置', () => {
     }
   })
 
-  it('不存在任何业务路由（P2-e 范围守卫）', () => {
+  it('/contracts 解析到 contracts 命名路由', async () => {
+    const router = createTestRouter()
+    await router.push('/contracts')
+    expect(router.currentRoute.value.name).toBe('contracts')
+  })
+
+  it('工作台路由带上 taskId 参数', async () => {
+    const router = createTestRouter()
+    await router.push('/review-tasks/42/workbench')
+    expect(router.currentRoute.value.name).toBe('workbench')
+    expect(router.currentRoute.value.params.taskId).toBe('42')
+  })
+
+  it('业务路由白名单守卫', () => {
     const allPaths = routes.flatMap((route) => [
       route.path,
       ...(route.children ?? []).map((child) => `${route.path}${child.path}`),
     ])
 
-    // 这些属于后续阶段。若本阶段有人提前加了它们，这条用例会失败。
-    const forbidden = ['/contracts', '/reviews', '/rules', '/tasks', '/reports', '/login']
+    // 【本用例的前身是 P2-e 的「不存在任何业务路由」】
+    // 那条断言在 P11-5 加入合同列表时必然失效 —— 按守卫的本意改写为
+    // "**只允许已批准的业务路由出现**"，而不是删掉测试。
+    //
+    // 白名单演进：
+    //   P2-e   只有壳路由（/dashboard、/404）
+    //   P11-5  /contracts、/review-tasks/:taskId/workbench
+    const approvedBusinessRoutes = [
+      '/contracts',
+      '/review-tasks/:taskId/workbench',
+    ]
+
+    for (const path of approvedBusinessRoutes) {
+      expect(allPaths, `已批准的业务路由 ${path} 丢了`).toContain(path)
+    }
+
+    // 这些属于后续阶段。若有人提前加了它们，这条用例会失败。
+    const forbidden = ['/reviews', '/rules', '/tasks', '/reports', '/login']
     for (const path of forbidden) {
-      expect(allPaths, `P2-e 不应包含业务路由 ${path}`).not.toContain(path)
+      expect(allPaths, `不应提前加入业务路由 ${path}`).not.toContain(path)
     }
   })
 })

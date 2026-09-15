@@ -87,12 +87,16 @@ describe('基础布局', () => {
     expect(wrapper.findAll('.header')).toHaveLength(1)
   })
 
-  it('侧边栏包含唯一的真实菜单项「审查大盘」', async () => {
+  it('侧边栏只列出已经落地的业务菜单项', async () => {
+    // 【本用例的前身是 P2-e 的「唯一的真实菜单项」】
+    // 那条断言在 P11-5 加入合同列表时必然失效 —— 按本意改写为
+    // "**菜单项恰好是已批准的这几个**"，而不是删掉测试或放宽成"至少一个"。
+    // 后者会让将来误加一个 disabled 占位菜单也悄悄通过。
     const { wrapper } = await mountApp(pinia)
 
-    const menuItems = wrapper.findAll('.el-menu-item')
-    expect(menuItems).toHaveLength(1)
-    expect(menuItems[0]!.text()).toContain('审查大盘')
+    const labels = wrapper.findAll('.el-menu-item').map((item) => item.text())
+
+    expect(labels).toEqual(['审查大盘', '合同列表'])
   })
 
   it('RouterView 渲染出 dashboard 占位页（Element Plus 生效）', async () => {

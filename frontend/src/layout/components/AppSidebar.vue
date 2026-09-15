@@ -2,11 +2,13 @@
 /**
  * 侧边栏导航。
  *
- * 本阶段只有「审查大盘」一个真实菜单项。
- * 刻意**不添加**合同/任务/风险/规则/报告等 disabled 占位菜单 ——
+ * 目前有「审查大盘」与「合同列表」两个**可用**菜单项。
+ *
+ * 仍然刻意**不添加**任务/风险/规则/报告等 disabled 占位菜单 ——
  * 那会提前制造出并不存在的业务结构；等对应阶段落地时再逐项加入。
+ * P11-5 加入「合同列表」正是这条规矩的兑现：页面真的能在那里用。
  */
-import { DataAnalysis } from '@element-plus/icons-vue'
+import { DataAnalysis, Document } from '@element-plus/icons-vue'
 import { computed } from 'vue'
 import { useRoute } from 'vue-router'
 
@@ -39,6 +41,11 @@ const activeMenu = computed(() => route.path)
       <el-menu-item index="/dashboard">
         <el-icon><DataAnalysis /></el-icon>
         <template #title>审查大盘</template>
+      </el-menu-item>
+
+      <el-menu-item index="/contracts">
+        <el-icon><Document /></el-icon>
+        <template #title>合同列表</template>
       </el-menu-item>
     </el-menu>
   </div>
