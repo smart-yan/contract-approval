@@ -88,8 +88,14 @@ def test_only_approved_business_routes_are_mounted(app: FastAPI) -> None:
     白名单演进：
     * P4    ``/api/v1/contracts``  —— 合同接入
     * P8-0  ``/api/v1/rule-sets``  —— 规则读取（只读，给 Agent 取规则用）
+    * P9-10 ``/api/v1/review-tasks/{task_id}/risks`` —— 风险写入
+      （Agent 合并后的最终风险整批落库，并把任务置为已审查）
     """
-    approved = {"/api/v1/contracts", "/api/v1/rule-sets"}
+    approved = {
+        "/api/v1/contracts",
+        "/api/v1/rule-sets",
+        "/api/v1/review-tasks/{task_id}/risks",
+    }
 
     paths = set(app.openapi()["paths"])
     mounted = {path for path in paths if path.startswith("/api/v1")}

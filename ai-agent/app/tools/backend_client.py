@@ -29,6 +29,7 @@ Backend 的幂等与并发控制就被绕过了，两边的业务规则也会开
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -81,6 +82,23 @@ class UploadOutcome:
 
     ``ok=True`` 时 ``payload`` 是 Backend 的 ``ContractIngestResponse`` 字典；
     ``ok=False`` 时 ``error_code`` / ``error_message`` 有值。
+    """
+
+    ok: bool
+    status_code: int | None
+    payload: dict[str, Any] | None
+    error_code: str | None
+    error_message: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class PersistOutcome:
+    """一次 :meth:`BackendClient.persist_task_risks` 调用的结果。
+
+    形状与 :class:`UploadOutcome` 相同，**刻意不合并成一个通用类型**：
+    两者的 ``payload`` 是两种完全不同的响应体（``ContractIngestResponse`` vs
+    ``RiskPersistResponse``），合并只会让类型名丢掉"这是哪一次调用"的信息，
+    而调用方仍然要按各自的方法去读自己那几个键。
     """
 
     ok: bool
@@ -287,5 +305,85 @@ class BackendClient:
             )
         return payload
 
+    # ------------------------------ 风险写入 ------------------------------ #
+    async def persist_task_risks(
+        self,
+        task_id: int,
+        *,
+        risks: Sequence[dict[str, Any]],
+    ) -> PersistOutcome:
+        """调用 ``POST /api/v1/review-tasks/{task_id}/risks``，把整批风险写进 Backend。
 
-__all__ = ["API_V1_PREFIX", "BackendClient", "BackendRequestError", "UploadOutcome"]
+        :param risks: **已经映射好**的请求体条目（映射在
+            ``app/tools/risk_persistence.py`` —— 本层只做 transport，
+            不认识 :class:`~app.risk.schemas.AgentRiskItem`）
+
+        本方法**不抛业务异常**：所有失败都翻译成 :class:`PersistOutcome`，
+        由调用它的节点写进 State。与 ``upload_contract`` 同一口径 ——
+        被拒绝（任务已写入过、规则编码解析不出来）也是一种要如实上报的结果，
+        而不是需要在每一层都显式接住的异常。
+
+        ``409 TASK_ALREADY_PERSISTED`` 在这里**不是特殊分支**：它按普通失败处理，
+        ``error_code`` 原样带回 Backend 的错误码。
+        """
+        client = self._ensure_client()
+
+        try:
+            response = await client.post(
+                f"{self._api_base}/review-tasks/{task_id}/risks",
+                json={"risks": list(risks)},
+                timeout=self._timeout,
+            )
+        except httpx.HTTPError as exc:
+            return PersistOutcome(
+                ok=False,
+                status_code=None,
+                payload=None,
+                error_code=AgentErrorCode.BACKEND_UNREACHABLE.value,
+                error_message=f"调用 Backend 写入风险失败：{exc}",
+            )
+
+        if response.status_code in _SUCCESS_STATUS:
+            try:
+                payload = response.json()
+            except ValueError:
+                return PersistOutcome(
+                    ok=False,
+                    status_code=response.status_code,
+                    payload=None,
+                    error_code=AgentErrorCode.BACKEND_REJECTED.value,
+                    error_message=f"Backend 返回 {response.status_code}，但响应体不是 JSON",
+                )
+            if not isinstance(payload, dict):
+                return PersistOutcome(
+                    ok=False,
+                    status_code=response.status_code,
+                    payload=None,
+                    error_code=AgentErrorCode.BACKEND_REJECTED.value,
+                    error_message="Backend 的成功响应不是 JSON 对象",
+                )
+            return PersistOutcome(
+                ok=True,
+                status_code=response.status_code,
+                payload=payload,
+                error_code=None,
+                error_message=None,
+            )
+
+        error_code, error_message = _extract_error(response)
+        return PersistOutcome(
+            ok=False,
+            status_code=response.status_code,
+            payload=None,
+            error_code=error_code,
+            error_message=error_message,
+        )
+
+
+__all__ = [
+    "API_V1_PREFIX",
+    "BackendClient",
+    "BackendRequestError",
+    "PersistOutcome",
+    "UploadOutcome",
+]

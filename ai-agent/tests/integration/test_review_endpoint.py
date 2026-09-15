@@ -243,7 +243,7 @@ def test_valid_file_runs_the_whole_workflow(agent: Callable[[Handler], TestClien
     assert body["workflow_status"] == "completed"
 
     # 1) 确实把文件转发给了 Backend 的接入接口
-    assert len(requests) == 1
+    #    ⚠️ P9-10 起图尾还会调一次风险写入接口，因此断言的是**第一次**调用
     assert requests[0].method == "POST"
     assert str(requests[0].url) == EXPECTED_UPLOAD_URL
     assert requests[0].headers["content-type"].startswith("multipart/form-data;")

@@ -365,17 +365,18 @@ def test_the_node_calls_the_domain_functions_instead_of_reimplementing_them() ->
 # --------------------------------------------------------------------------- #
 # 8. Graph 接线
 # --------------------------------------------------------------------------- #
-def test_the_graph_ends_with_the_merge_node() -> None:
-    """顺序：``rule_review → llm_review → merge_risks → END``。"""
-    from langgraph.graph import END
+def test_the_merge_node_follows_the_llm_node() -> None:
+    """顺序：``rule_review → llm_review → merge_risks``。
 
+    ⚠️ P9-10 在合并之后接了 ``persist_risks``，因此这里**不再**断言
+    "合并之后就是 END" —— 那条链路由 ``test_persist_risks_node.py`` 负责。
+    """
     graph = build_review_graph().get_graph()
     edges = {(edge.source, edge.target) for edge in graph.edges}
 
     assert NODE_MERGE_RISKS in graph.nodes
     assert (NODE_RULE_REVIEW, NODE_LLM_REVIEW) in edges, "规则审查之后是模型审查"
     assert (NODE_LLM_REVIEW, NODE_MERGE_RISKS) in edges, "模型审查之后是风险合并"
-    assert (NODE_MERGE_RISKS, END) in edges, "合并之后收尾"
 
     incoming = {edge.source for edge in graph.edges if edge.target == NODE_MERGE_RISKS}
     assert incoming == {NODE_LLM_REVIEW}, "合并只有一个入口：模型审查之后"

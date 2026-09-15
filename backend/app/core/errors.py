@@ -99,6 +99,9 @@ class ErrorCode(StrEnum):
     TASK_TIMEOUT = "TASK_TIMEOUT"
     TASK_RETRY_EXHAUSTED = "TASK_RETRY_EXHAUSTED"
     TASK_ALREADY_COMPLETED = "TASK_ALREADY_COMPLETED"  # completed 为终态，不可回退（§6.1）
+    #: 该任务的审查风险已经写入过，拒绝重复写入（P9-10 幂等）。
+    #: ⚠️ 不覆盖、不追加 —— 已落库的风险可能已经带有人工复核结果
+    TASK_ALREADY_PERSISTED = "TASK_ALREADY_PERSISTED"
 
     # ------------------------ 解析 / OCR ------------------------ #
     OCR_FAILED = "OCR_FAILED"
@@ -169,6 +172,9 @@ ERROR_SPECS: dict[ErrorCode, ErrorSpec] = {
     ErrorCode.TASK_RETRY_EXHAUSTED: ErrorSpec(409, ErrorCategory.SYSTEM_ERROR, "重试次数已耗尽"),
     ErrorCode.TASK_ALREADY_COMPLETED: ErrorSpec(
         409, ErrorCategory.USER_ERROR, "任务已完成，如需重新审查请新建任务"
+    ),
+    ErrorCode.TASK_ALREADY_PERSISTED: ErrorSpec(
+        409, ErrorCategory.USER_ERROR, "该任务的审查风险已写入，不允许重复写入或覆盖"
     ),
     # ------------------------ 解析 / OCR ------------------------ #
     ErrorCode.OCR_FAILED: ErrorSpec(422, ErrorCategory.SYSTEM_ERROR, "OCR 识别失败"),

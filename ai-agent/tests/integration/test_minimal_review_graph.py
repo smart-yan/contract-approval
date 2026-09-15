@@ -148,7 +148,8 @@ async def test_valid_file_runs_through_to_parse(
     final = await _run(make_backend(handler), source_file)
 
     # 1) 确实调用了 Backend 的 P4 接入接口，而不是 Agent 自己解析/落盘
-    assert len(requests) == 1
+    #    ⚠️ P9-10 起图尾还会调一次风险写入接口（``/review-tasks/{id}/risks``），
+    #    因此这里断言的是**第一次**调用，而不是"总共只有一次"
     assert requests[0].method == "POST"
     assert str(requests[0].url) == EXPECTED_UPLOAD_URL
     assert requests[0].headers["content-type"].startswith("multipart/form-data;")
