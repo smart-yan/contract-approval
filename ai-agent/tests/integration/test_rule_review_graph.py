@@ -6,7 +6,8 @@
 ::
 
     upload_file → validate_file → parse_document → identify_clauses
-                → extract_metadata → extract_keywords → rule_review → END
+                → extract_metadata → extract_keywords → rule_review
+                → llm_review → merge_risks → END
 
 文档用的是**真实 DOCX**（经「XML 样式 + 段落切分 + 条款识别」全链路），
 规则用的是与 seed 同形的 3 条。节点的编解码细节由

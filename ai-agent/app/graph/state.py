@@ -32,6 +32,8 @@ rules      ``rule_snapshot`` 是**输入**，``rule_evaluations`` / ``rule_risks
            ``rule_review`` 的产出
 llm        ``llm_findings`` 是 ``llm_review`` 的产出；``llm_error_*`` 是它的
            **降级**信号（与 ``error_code`` 不是一回事，见字段注释）
+risks      ``risks`` 是 ``merge_risks`` 的产出（P9-9）—— 两条来源合并后的
+           **最终统一风险列表**，与 ``rule_risks`` / ``llm_findings`` 语义不同
 failure    失败信息，同样供 Conditional Edge 读取
 """
 
@@ -40,6 +42,7 @@ from __future__ import annotations
 from typing import TypedDict
 
 from app.llm.finding_resolution import ResolvedFinding
+from app.risk.schemas import AgentRiskItem
 from app.rules.schemas import RuleEvaluationResult, RuleRisk, RuleSetSnapshot
 from app.schemas.document import ParseResult
 from app.schemas.understanding import Clause, KeywordHit, MetadataItem
@@ -116,6 +119,29 @@ class ContractReviewState(TypedDict, total=False):
     #: **一次降级**（``llm_error_code``）是两件事，各有各的分流。
     llm_error_code: str | None
     llm_error_message: str | None
+
+    # ------------------------------- risks ------------------------------ #
+    #: merge_risks：**最终的统一风险列表**（P9-9 接入）。
+    #: 规则与模型两条来源经 ``unify`` 映射、再由 ``merge`` 收敛后的结果，
+    #: 元素是 :class:`~app.risk.schemas.AgentRiskItem`。
+    #:
+    #: 它与上面两个键**语义不同**，三者互不替代（各有各的消费者）：
+    #:
+    #: ==================  ==============================================
+    #: ``rule_risks``      只有规则来源，未合并（``RuleRisk``）
+    #: ``llm_findings``    只有模型来源，**已定位但还不是风险项**（``ResolvedFinding``）
+    #: ``risks``           **两者合并之后**的统一风险项 —— 评分 / 落库 / 报告只认它
+    #: ==================  ==============================================
+    #:
+    #: ``rule_risks`` / ``llm_findings`` **不因合并而被覆盖或改写**：它们既是回溯的
+    #: 依据（"这条风险为什么成立"要能指回规则与模型各自的原始说法），
+    #: 也是"合并到底并掉了什么"的唯一证据。
+    #:
+    #: ⚠️ ``risks`` **有值**（含空列表）表示**合并跑过**，但**不表示这次审查成功** ——
+    #: 规则审查失败时图并不会停（``error_code`` 由 ``rule_review`` 写下，
+    #: 后面照常走到这里），只是规则侧没有输入。判"这次审查可用吗"仍然只看
+    #: ``error_code`` / ``has_usable_document``，不看这个键。
+    risks: list[AgentRiskItem]
 
     # ------------------------------ failure ----------------------------- #
     error_code: str | None

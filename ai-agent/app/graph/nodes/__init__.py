@@ -4,6 +4,7 @@ from app.graph.nodes.extract_keywords import extract_keywords
 from app.graph.nodes.extract_metadata import extract_metadata
 from app.graph.nodes.identify_clauses import identify_clauses
 from app.graph.nodes.llm_review import llm_review
+from app.graph.nodes.merge_risks import merge_risks
 from app.graph.nodes.parse_document import parse_document
 from app.graph.nodes.rule_review import rule_review
 from app.graph.nodes.upload_file import upload_file
@@ -14,6 +15,7 @@ __all__ = [
     "extract_metadata",
     "identify_clauses",
     "llm_review",
+    "merge_risks",
     "parse_document",
     "rule_review",
     "upload_file",

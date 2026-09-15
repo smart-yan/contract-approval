@@ -70,7 +70,9 @@ class RiskSource(StrEnum):
     与架构文档 §7.2 的写法一致，不要"顺手改成下划线"。
 
     谁产出它：**Agent**。两个映射函数分别产出 :attr:`RULE` 与 :attr:`LLM`；
-    :attr:`RULE_AND_LLM` 只在**合并**之后出现（合并是后续步骤，本轮不产出它）。
+    :attr:`RULE_AND_LLM` **只在合并之后**出现 —— 唯一的产出点是
+    :func:`app.risk.merge.merge_risk_items`（P9-9），且仅当那一条确实同时
+    来自规则与模型时才产出。映射层永远不产出它。
     """
 
     RULE = "RULE"

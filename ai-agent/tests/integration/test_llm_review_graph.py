@@ -5,8 +5,8 @@ Agent 自己的节点、State 流转、Conditional Edge 分流全部真实执行
 
 ::
 
-    … → extract_keywords → rule_review → llm_review ─┬─ continue → END
-                                                      └─ fallback → END
+    … → extract_keywords → rule_review → llm_review ─┬─ continue ─┐
+                                                      └─ fallback ─┴→ merge_risks → END
 
 三条走向各自对应一类结局：
 
@@ -17,6 +17,9 @@ LLM 正常                            有 ``llm_findings``，无 ``llm_error_cod
 LLM 不可用 / 输出不合契约            进降级通道，**``rule_risks`` 一条不少**
 没有 provider                        同样是降级；且**不发任何 LLM 请求**
 ==================================  ============================================
+
+**两条分支都通向 ``merge_risks``**（P9-9 接入）：降级的意思是"这次没有模型结论"，
+不是"风险合并不用做了" —— 所以无论走哪条路，最后都有一份统一风险列表。
 """
 
 from __future__ import annotations
@@ -29,13 +32,16 @@ from typing import Any
 import httpx
 import pytest
 
+from app.core.constants import RiskSource
 from app.core.errors import AgentErrorCode
 from app.graph.builder import NODE_LLM_REVIEW, NODE_RULE_REVIEW, build_review_graph
 from app.graph.context import ReviewContext
+from app.llm.finding_resolution import ResolvedFinding
 from app.llm.json_guard import LLMSchemaInvalidError
 from app.llm.provider import LLMProvider, LLMUnavailableError
 from app.llm.schemas import LLMRequest, LLMResult
-from app.rules.schemas import AgentRule, RuleSetSnapshot
+from app.risk.schemas import AgentRiskItem
+from app.rules.schemas import AgentRule, RuleRisk, RuleSetSnapshot
 from app.tools.backend_client import BackendClient
 from app.understanding.locator import ANCHOR_CLAUSE_SCOPED
 from tests.factories import docx_bytes
@@ -291,3 +297,91 @@ async def test_workflow_still_completes_in_both_branches(
         assert final["parse_result"].status == "PARSED"
         assert final["clauses"], "两條路都必须把前面的产物带到底"
         assert final["rule_evaluations"], "规则求值在两条路里都完成过"
+
+
+# --------------------------------------------------------------------------- #
+# 统一风险（P9-9 接过 llm_review 之后的收尾节点）
+# --------------------------------------------------------------------------- #
+#: 与规则**同名同段**的模型结论：带着 `related_rule_code`，会被合并成一条 RULE+LLM
+MATCHING_FINDING: dict[str, Any] = {**GOOD_FINDING, "related_rule_code": "IP_OWNER_SUPPLIER_001"}
+
+
+async def test_the_run_finishes_with_a_unified_risk_list(
+    make_backend: Callable[[Handler], BackendClient], source_file: Path
+) -> None:
+    """跑到 END 时，State 里有一份**统一形状**的风险列表（不再是两份各说各话）。
+
+    ``GOOD_FINDING`` 没有 ``related_rule_code``，因此规则那条与模型那条**不合并** ——
+    两条来源各自成一条，但都是同一种类型（``AgentRiskItem``）。
+    """
+    final = await _run(make_backend(_ok_handler()), source_file, FakeProvider(findings=[GOOD_FINDING]))
+
+    risks = final["risks"]
+    assert [risk.source for risk in risks] == [RiskSource.RULE, RiskSource.LLM]
+    assert {type(risk) for risk in risks} == {AgentRiskItem}
+    assert all(risk.quote in risk.original_text for risk in risks)
+
+
+async def test_a_matching_finding_is_merged_with_its_rule(
+    make_backend: Callable[[Handler], BackendClient], source_file: Path
+) -> None:
+    """模型说"我就是规则 IP_OWNER_SUPPLIER_001"且落在同一段 → 合成**一条**。"""
+    final = await _run(make_backend(_ok_handler()), source_file, FakeProvider(findings=[MATCHING_FINDING]))
+
+    (risk,) = final["risks"]
+    assert risk.source is RiskSource.RULE_AND_LLM
+    assert risk.risk_code == "IP_OWNER_SUPPLIER_001"
+    assert risk.paragraph_index == 1, "位置来自 P9-7 的真实定位结果"
+
+
+async def test_the_degraded_path_still_produces_unified_risks(
+    make_backend: Callable[[Handler], BackendClient], source_file: Path
+) -> None:
+    """**降级≠跳过合并**：LLM 挂掉时统一列表仍然产出，内容就是规则风险。
+
+    若 fallback 直接收尾，一次 LLM 抽风就会让整份统一风险列表凭空消失 ——
+    而这正是 §9.1 要防的"降级成仅规则结果"。
+    """
+    final = await _run(
+        make_backend(_ok_handler()), source_file, FakeProvider(error=LLMUnavailableError("503"))
+    )
+
+    (risk,) = final["risks"]
+    assert risk.source is RiskSource.RULE
+    assert risk.risk_code == "IP_OWNER_SUPPLIER_001"
+    assert final["llm_error_code"] == AgentErrorCode.LLM_UNAVAILABLE.value
+    assert final.get("error_code") is None, "降级**不是**整次审查的失败"
+
+
+async def test_the_two_source_keys_survive_the_merge(
+    make_backend: Callable[[Handler], BackendClient], source_file: Path
+) -> None:
+    """合并**不改写** ``rule_risks`` / ``llm_findings`` —— 三者在 State 里并存。
+
+    它们是这次合并的输入与证据：下游要能回溯"这条风险为什么成立"，
+    也要能看出"合并到底并掉了什么"。
+    """
+    final = await _run(make_backend(_ok_handler()), source_file, FakeProvider(findings=[MATCHING_FINDING]))
+
+    assert isinstance(final["rule_risks"][0], RuleRisk)
+    assert isinstance(final["llm_findings"][0], ResolvedFinding)
+    assert len(final["risks"]) == 1, "两条来源 → 一条统一风险项"
+
+
+async def test_a_run_without_any_risk_ends_with_an_empty_unified_list(
+    make_backend: Callable[[Handler], BackendClient], tmp_path: Path
+) -> None:
+    """两侧都没命中 → ``risks=[]`` —— 是**结论**，不是"我们没跑"。
+
+    这份文档里没有 IP 条款（规则的目标条款类型是 ``IP``，因此它拿不到可审的条款），
+    模型也不报任何发现 —— 于是合并的输入为空，输出是**空列表而不是缺失**。
+    """
+    plain = tmp_path / "no-risk.docx"
+    plain.write_bytes(docx_bytes("第一条 交付", "乙方应当在合同签订后三十日内交付全部设备。"))
+
+    final = await _run(make_backend(_ok_handler()), plain, FakeProvider(findings=[]))
+
+    assert final["rule_risks"] == [], "规则没有可审的目标条款"
+    assert "llm_findings" in final
+    assert final["risks"] == []
+    assert final.get("error_code") is None
