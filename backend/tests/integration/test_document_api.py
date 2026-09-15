@@ -640,3 +640,95 @@ async def test_concurrent_writes_only_one_wins(
     assert rejected.json()["code"] == ErrorCode.DOCUMENT_ALREADY_PERSISTED.value
     assert len(_blocks_of(fixture_ids["contract_id"])) == 3, "块不能翻倍"
     assert _scalar("SELECT COUNT(*) FROM clause WHERE task_id = %s", (task_id,)) == 2
+
+
+# --------------------------------------------------------------------------- #
+# 与 P9-10 风险层的接缝
+# --------------------------------------------------------------------------- #
+def _risk(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "risk_code": "IP_OWNER_SUPPLIER_001",
+        "risk_title": "知识产权归属相对方",
+        "dimension": "知识产权",
+        "risk_level": "HIGH",
+        "source": "RULE",
+        "quote": "知识产权归乙方",
+        "paragraph_index": 1,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_the_risks_that_follow_resolve_their_clause_id(
+    client: TestClient, fixture_ids: dict[str, int]
+) -> None:
+    """**两个接口的接缝**：文档层落了条款之后，P9-10 的 ``clause_id`` 解析才真正生效。
+
+    在 P10-1 之前，``clause`` 表永远是空的，那段解析逻辑一直是**死代码**：
+    每个风险的 ``clause_id`` 都被解析成 NULL，而且不会报任何错。
+    这条用例是唯一守着这个接缝的地方 —— 没有它，将来"文档层不再落 clause"
+    这类回归会静默通过（风险照写，只是全部挂不到条款上）。
+
+    顺带确认两层的阶段语义能共存：文档层把阶段推进到 ``CLAUSED``，
+    风险层随后要求 ``!= REVIEWED`` 才能写入 —— 顺序由**行锁**串行化，天然成立。
+    """
+    task_id = fixture_ids["task_id"]
+    _post(client, task_id, _payload())
+
+    response = client.post(
+        f"/api/v1/review-tasks/{task_id}/risks",
+        json={
+            "risks": [
+                _risk(paragraph_index=1),
+                _risk(
+                    risk_code="LIAB_UNLIMITED_001",
+                    dimension="违约责任",
+                    quote="第二条 违约责任",
+                    paragraph_index=2,
+                ),
+            ]
+        },
+    )
+    assert response.status_code == 201
+
+    rows = _query(
+        "SELECT r.paragraph_index, c.clause_type, s.order_index, e.order_index "
+        "FROM risk_item r "
+        "JOIN clause c ON r.clause_id = c.id "
+        "JOIN document_block s ON c.start_block_id = s.id "
+        "JOIN document_block e ON c.end_block_id = e.id "
+        "WHERE r.task_id = %s ORDER BY r.id",
+        (task_id,),
+    )
+
+    assert len(rows) == 2, "两条风险的 clause_id 都必须解析出来（不是 NULL）"
+    assert rows[0][:2] == (1, "IP"), "段 1 落在 IP 条款（段 0-1）里"
+    assert rows[0][2:] == (0, 1)
+    assert rows[1][:2] == (2, "LIABILITY"), "段 2 落在违约责任条款（段 2-2）里"
+    assert rows[1][2:] == (2, 2)
+
+
+def test_the_document_layer_cannot_run_after_the_risk_layer(
+    client: TestClient, fixture_ids: dict[str, int]
+) -> None:
+    """**流水线顺序由阶段语义钉住**：风险层把阶段推到 ``REVIEWED`` 之后，
+    文档层再写就是 409 —— 不允许出现"风险已经落库、条款才补上"的倒置状态。
+
+    两个接口各锁 ``review_task`` 行，因此并发下也只会有一个先走完；
+    谁先谁后由阶段门禁判定，不靠调用方自觉。
+    """
+    task_id = fixture_ids["task_id"]
+    # 走完整流水线到达 REVIEWED：先文档层、再风险层
+    assert _post(client, task_id, _payload()).status_code == 201
+    first = client.post(f"/api/v1/review-tasks/{task_id}/risks", json={"risks": [_risk()]})
+    assert first.status_code == 201
+    before = _blocks_of(fixture_ids["contract_id"])
+
+    late = _post(client, task_id, _payload())
+
+    assert late.status_code == 409
+    assert late.json()["code"] == ErrorCode.DOCUMENT_ALREADY_PERSISTED.value
+    assert _blocks_of(fixture_ids["contract_id"]) == before, "被拒绝的文档层不碰已有的块"
+    assert _scalar("SELECT current_stage FROM review_task WHERE id = %s", (task_id,)) == "REVIEWED", (
+        "阶段没有被文档层改回去"
+    )

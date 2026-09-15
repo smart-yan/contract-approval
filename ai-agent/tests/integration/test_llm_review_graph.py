@@ -5,8 +5,8 @@ Agent 自己的节点、State 流转、Conditional Edge 分流全部真实执行
 
 ::
 
-    … → extract_keywords → rule_review → llm_review ─┬─ continue ─┐
-                                                      └─ fallback ─┴→ merge_risks → END
+    … → extract_keywords → persist_document → rule_review → llm_review ─┬─ continue ─┐
+                                                                         └─ fallback ─┴→ merge_risks → END
 
 三条走向各自对应一类结局：
 

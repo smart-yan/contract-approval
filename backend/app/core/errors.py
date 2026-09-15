@@ -112,6 +112,8 @@ class ErrorCode(StrEnum):
     #: 附件的解析状态已是终态（PARSED / FAILED），拒绝改写成另一个终态。
     #: ⚠️ 同值重复写入是允许的（同一文件服务多个任务时必然发生）
     PARSE_STATUS_ALREADY_FINAL = "PARSE_STATUS_ALREADY_FINAL"
+    #: 风险写入的前置缺失：任务还没走过文档层（``current_stage`` 未到 ``CLAUSED``）
+    DOCUMENT_NOT_PERSISTED = "DOCUMENT_NOT_PERSISTED"
 
     # ------------------------ 解析 / OCR ------------------------ #
     OCR_FAILED = "OCR_FAILED"
@@ -195,6 +197,11 @@ ERROR_SPECS: dict[ErrorCode, ErrorSpec] = {
     ),
     ErrorCode.PARSE_STATUS_ALREADY_FINAL: ErrorSpec(
         409, ErrorCategory.USER_ERROR, "附件的解析状态已是终态，不允许改写"
+    ),
+    #: 风险写入的前置缺失：任务还没走过文档层（current_stage 未到 CLAUSED）。
+    #: 此时写入会产出 clause_id 全为 NULL 的风险，并让文档层永久无法补写
+    ErrorCode.DOCUMENT_NOT_PERSISTED: ErrorSpec(
+        409, ErrorCategory.USER_ERROR, "该任务尚未持久化文档层结果，无法写入风险"
     ),
     # ------------------------ 解析 / OCR ------------------------ #
     ErrorCode.OCR_FAILED: ErrorSpec(422, ErrorCategory.SYSTEM_ERROR, "OCR 识别失败"),

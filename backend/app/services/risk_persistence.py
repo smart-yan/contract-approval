@@ -32,8 +32,14 @@ Backend 在这一层**不做任何智能判断**：不认识 LLM、不跑规则�
 
 ::
 
-    第一层（阶段门禁）  task.current_stage == REVIEWED  →  409
-    第二层（兜底）      该 task 已有 risk_item 行        →  409
+    前置门禁            task.current_stage != CLAUSED   →  409（DOCUMENT_NOT_PERSISTED）
+    第一层（阶段门禁）  task.current_stage == REVIEWED  →  409（TASK_ALREADY_PERSISTED）
+    第二层（兜底）      该 task 已有 risk_item 行        →  409（TASK_ALREADY_PERSISTED）
+
+**前置门禁由来**：风险依赖条款 —— ``risk_item.clause_id`` 要靠 ``clause`` 表才能解析。
+一个还没走过文档层的任务若被直接写入风险，会产出一批 ``clause_id`` 全为 NULL 的风险，
+并把阶段推到 ``REVIEWED``，于是文档层**永久**无法补写。这个顺序是**契约**，
+必须在服务端强制，不能只靠调用方自觉。
 
 两层都用 :attr:`~app.core.errors.ErrorCode.TASK_ALREADY_PERSISTED`（409），
 调用方不需要区分"被哪一层拦下的"。
@@ -154,6 +160,27 @@ async def persist_task_risks(task_id: int, risks: Sequence[RiskItemCreate]) -> R
                 f"任务 {task_id} 已处于 {TaskStage.REVIEWED.value} 阶段，本阶段的风险已持久化过"
                 "（哪怕当时写入的是空批次），不允许重复写入或覆盖。如需重新审查，请新建审查任务",
                 code=ErrorCode.TASK_ALREADY_PERSISTED,
+                details={"task_id": task_id, "current_stage": task.current_stage},
+            )
+
+        # ---- 前置门禁：文档层必须先落库 ----
+        # ⚠️ 风险**依赖**条款：``risk_item.clause_id`` 要靠 ``clause`` 表才能解析出来。
+        # 一个还没走过文档层的任务（``UPLOADED``）若被直接写入风险，会产出一批
+        # ``clause_id`` 全为 NULL 的风险，并把阶段推到 ``REVIEWED`` ——
+        # 于是文档层之后**永久**无法补写（它要求阶段未到 ``REVIEWED``），
+        # 库里留下"风险已落库、条款却永远补不上"的终局。
+        #
+        # 只靠"Agent 会按顺序调用"来规避是不行的：顺序是**契约**，必须在服务端强制。
+        if task.current_stage != TaskStage.CLAUSED.value:
+            logger.warning(
+                "拒绝在文档层落库前写入风险",
+                extra={"task_id": task_id, "current_stage": task.current_stage},
+            )
+            raise ConflictError(
+                f"任务 {task_id} 的当前阶段是 {task.current_stage}，尚未持久化文档层结果"
+                f"（需要 {TaskStage.CLAUSED.value}）。风险依赖条款解析 clause_id，"
+                "请先调用文档层写入接口",
+                code=ErrorCode.DOCUMENT_NOT_PERSISTED,
                 details={"task_id": task_id, "current_stage": task.current_stage},
             )
 

@@ -93,12 +93,16 @@ class UploadOutcome:
 
 @dataclass(frozen=True, slots=True)
 class PersistOutcome:
-    """一次 :meth:`BackendClient.persist_task_risks` 调用的结果。
+    """一次"把 Agent 的产出整批写回某个任务"的调用结果。
 
-    形状与 :class:`UploadOutcome` 相同，**刻意不合并成一个通用类型**：
-    两者的 ``payload`` 是两种完全不同的响应体（``ContractIngestResponse`` vs
-    ``RiskPersistResponse``），合并只会让类型名丢掉"这是哪一次调用"的信息，
-    而调用方仍然要按各自的方法去读自己那几个键。
+    覆盖 :meth:`BackendClient.persist_task_risks`（P9-10）与
+    :meth:`BackendClient.persist_task_document`（P10-3）——
+    两者都是"向任务下的某个批量写接口 POST 一批已映射好的条目"，
+    传输层关心的东西完全一样（状态码 / 响应体 / 错误码），
+    因此**共用**这一个形状。
+
+    与 :class:`UploadOutcome` 仍然分开：那个的 ``payload`` 是
+    ``ContractIngestResponse``，且它内部还要处理文件流，形态本就不同。
     """
 
     ok: bool
@@ -341,6 +345,88 @@ class BackendClient:
                 payload=None,
                 error_code=AgentErrorCode.BACKEND_UNREACHABLE.value,
                 error_message=f"调用 Backend 写入风险失败：{exc}",
+            )
+
+        if response.status_code in _SUCCESS_STATUS:
+            try:
+                payload = response.json()
+            except ValueError:
+                return PersistOutcome(
+                    ok=False,
+                    status_code=response.status_code,
+                    payload=None,
+                    error_code=AgentErrorCode.BACKEND_REJECTED.value,
+                    error_message=f"Backend 返回 {response.status_code}，但响应体不是 JSON",
+                )
+            if not isinstance(payload, dict):
+                return PersistOutcome(
+                    ok=False,
+                    status_code=response.status_code,
+                    payload=None,
+                    error_code=AgentErrorCode.BACKEND_REJECTED.value,
+                    error_message="Backend 的成功响应不是 JSON 对象",
+                )
+            return PersistOutcome(
+                ok=True,
+                status_code=response.status_code,
+                payload=payload,
+                error_code=None,
+                error_message=None,
+            )
+
+        error_code, error_message = _extract_error(response)
+        return PersistOutcome(
+            ok=False,
+            status_code=response.status_code,
+            payload=None,
+            error_code=error_code,
+            error_message=error_message,
+        )
+
+    # ------------------------------ 文档写入 ------------------------------ #
+    async def persist_task_document(
+        self,
+        task_id: int,
+        *,
+        parse_status: str,
+        blocks: Sequence[dict[str, Any]],
+        clauses: Sequence[dict[str, Any]],
+        metadata: Sequence[dict[str, Any]],
+    ) -> PersistOutcome:
+        """调用 ``POST /api/v1/review-tasks/{task_id}/document``，把文档层结果写回 Backend。
+
+        :param parse_status: ``PARSED`` / ``FAILED``（Backend 只收这两个终态）
+        :param blocks / clauses / metadata: **已经映射好**的请求体条目
+            （映射在 ``app/tools/document_persistence.py`` —— 本层只做 transport，
+            不认识 :class:`~app.schemas.document.ParseResult` / ``Clause`` / ``MetadataItem``）
+
+        本方法**不抛业务异常**：所有失败都翻译成 :class:`PersistOutcome`，
+        与 ``persist_task_risks`` 同一口径。
+
+        ⚠️ 三张表在 Backend 侧是**一个事务**：``clause`` / ``metadata`` 引用本次写入的
+        ``document_block.id``（由 Backend 按请求里的下标解析）。因此这里必须**一次调用**
+        把三者一起发出去，不能拆。
+        """
+        client = self._ensure_client()
+
+        try:
+            response = await client.post(
+                f"{self._api_base}/review-tasks/{task_id}/document",
+                json={
+                    "parse_status": parse_status,
+                    "blocks": list(blocks),
+                    "clauses": list(clauses),
+                    "metadata": list(metadata),
+                },
+                timeout=self._timeout,
+            )
+        except httpx.HTTPError as exc:
+            return PersistOutcome(
+                ok=False,
+                status_code=None,
+                payload=None,
+                error_code=AgentErrorCode.BACKEND_UNREACHABLE.value,
+                error_message=f"调用 Backend 写入文档层失败：{exc}",
             )
 
         if response.status_code in _SUCCESS_STATUS:

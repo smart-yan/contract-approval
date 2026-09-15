@@ -50,5 +50,11 @@ class AgentErrorCode(StrEnum):
     #: LLM 的输出不是合法 JSON，或不满足请求里声明的 schema（P9-1）
     LLM_SCHEMA_INVALID = "LLM_SCHEMA_INVALID"
 
+    #: 解析/理解层的产物**自相矛盾**，拼不出一条合法的文档层持久化请求（P10-4）。
+    #: 例如条款引用了 ``paragraphs`` 里根本不存在的段落号、条款区间倒置。
+    #: ⚠️ 与 ``BACKEND_REJECTED`` 的责任方不同：那个是"Backend 拒绝了我们的请求"，
+    #: 这个是"我们自己的产物根本不成立" —— 混在一起排查时分会不清该看哪边。
+    DOCUMENT_MAPPING_INVALID = "DOCUMENT_MAPPING_INVALID"
+
 
 __all__ = ["AgentErrorCode"]

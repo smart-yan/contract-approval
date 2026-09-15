@@ -58,6 +58,23 @@ def route_after_parse(state: ContractReviewState) -> RouteBranch:
     return "continue" if has_usable_document(state) else "stop"
 
 
+def route_after_persist_document(state: ContractReviewState) -> RouteBranch:
+    """文档层落库成功才继续规则审查，失败就结束。
+
+    判断依据只有 ``persist_document`` 写在**致命通道**上的 ``error_code`` ——
+    它不是 ``llm_error_code`` 那种降级信号：文档层写不回去，后面的规则与 LLM
+    产出**同样写不回去**（Backend 的风险接口要求阶段已到 ``CLAUSED``），
+    继续跑只是白烧一遍模型调用。
+
+    ``error_code`` 缺失（节点没跑 / 键名写错）时走 ``continue`` ——
+    ⚠️ 这一条与 ``route_after_parse`` 的 fail-closed 方向不同，是刻意的：
+    本节点成功时**不写任何 State**（结果已经在 Backend 里），因此"没有 error"
+    就是它能给出的唯一成功信号。**"节点根本没被接进图"属于图结构问题**，
+    由拓扑测试守着，不靠一个状态位兜底。
+    """
+    return "stop" if state.get("error_code") else "continue"
+
+
 def route_after_llm_review(state: ContractReviewState) -> LLMRouteBranch:
     """LLM 审查有结论就正常走，降级就走去掉 LLM 结论的那条路。
 
@@ -85,5 +102,6 @@ __all__ = [
     "RouteBranch",
     "route_after_llm_review",
     "route_after_parse",
+    "route_after_persist_document",
     "route_after_validate",
 ]

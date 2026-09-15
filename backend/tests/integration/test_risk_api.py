@@ -155,13 +155,19 @@ def _insert_file(contract_id: int, *, file_ext: str = "docx") -> int:
     return _scalar("SELECT MAX(id) FROM contract_file")
 
 
-def _insert_task(contract_id: int, file_id: int) -> int:
+def _insert_task(contract_id: int, file_id: int, *, stage: str = "CLAUSED") -> int:
+    """建一个可写风险的任务。
+
+    ⚠️ 默认阶段是 ``CLAUSED`` 而不是 ``UPLOADED``：风险写入**要求文档层先落库**
+    （``risk_item.clause_id`` 要靠 ``clause`` 解析），这是服务端强制的契约。
+    ``UPLOADED`` 那一侧由 ``test_risks_cannot_be_written_before_the_document_layer`` 专门覆盖。
+    """
     _query(
         "INSERT INTO review_task "
         "(contract_id, file_id, status, current_stage, progress, priority, version, retry_count, "
         " max_retry, idempotency_key, created_at, updated_at) "
-        "VALUES (%s, %s, 'pending', 'UPLOADED', 0, 0, 0, 0, 3, %s, NOW(3), NOW(3))",
-        (contract_id, file_id, uuid.uuid4().hex + uuid.uuid4().hex),
+        "VALUES (%s, %s, 'pending', %s, 0, 0, 0, 0, 3, %s, NOW(3), NOW(3))",
+        (contract_id, file_id, stage, uuid.uuid4().hex + uuid.uuid4().hex),
     )
     return _scalar("SELECT MAX(id) FROM review_task")
 
@@ -554,12 +560,83 @@ def test_a_rolled_back_batch_leaves_the_task_untouched(
         "SELECT status, current_stage, finished_at FROM review_task WHERE id = %s",
         (fixture_ids["task_id"],),
     )[0]
-    assert row == ("pending", "UPLOADED", None)
+    assert row == ("pending", "CLAUSED", None)
 
 
 # --------------------------------------------------------------------------- #
 # 其它
 # --------------------------------------------------------------------------- #
+def test_risks_cannot_be_written_before_the_document_layer(
+    client: TestClient, fixture_ids: dict[str, int]
+) -> None:
+    """**前置门禁**：文档层没落库之前，风险一律不写。
+
+    没有这道门禁就会出现一条不可逆的坏终局：风险先落库（``clause_id`` 全为 NULL），
+    阶段被推到 ``REVIEWED``，于是文档层**永久**无法补写 ——
+    库里留下一批"永远挂不上条款"的风险，而且不会有任何报错。
+    只靠"Agent 会按顺序调用"规避是不行的：顺序是契约，必须在服务端强制。
+    """
+    contract_id, file_id = fixture_ids["contract_id"], fixture_ids["file_id"]
+    fresh_task = _insert_task(contract_id, file_id, stage="UPLOADED")
+
+    response = _post(client, fresh_task, [_risk()])
+
+    assert response.status_code == 409
+    assert response.json()["code"] == ErrorCode.DOCUMENT_NOT_PERSISTED.value
+    assert _risks_of(fresh_task) == [], "一条风险都不许写进去"
+    assert _scalar("SELECT current_stage FROM review_task WHERE id = %s", (fresh_task,)) == "UPLOADED", (
+        "被拒绝的请求不推进阶段"
+    )
+    assert _scalar("SELECT COUNT(*) FROM document_block WHERE contract_id = %s", (contract_id,)) == 0, (
+        "文档层仍然可以补写"
+    )
+
+
+def test_the_document_layer_can_still_be_written_after_a_rejected_risk_attempt(
+    client: TestClient, fixture_ids: dict[str, int]
+) -> None:
+    """被前置门禁拒绝**不会**堵死文档层 —— 补上文档层之后风险照常可写。
+
+    这正是这道门禁要保住的东西：拒绝只发生在"顺序错了"的时候，
+    纠正顺序之后整条流水线仍然走得通。
+    """
+    contract_id, file_id = fixture_ids["contract_id"], fixture_ids["file_id"]
+    fresh_task = _insert_task(contract_id, file_id, stage="UPLOADED")
+
+    assert _post(client, fresh_task, [_risk()]).status_code == 409
+
+    document = client.post(
+        f"/api/v1/review-tasks/{fresh_task}/document",
+        json={
+            "parse_status": "PARSED",
+            "blocks": [
+                {
+                    "order_index": 0,
+                    "paragraph_index": 23,
+                    "block_type": "PARAGRAPH",
+                    "text": "本项目产生的知识产权归乙方所有。",
+                    "char_start_global": 0,
+                    "char_end_global": 16,
+                }
+            ],
+            "clauses": [
+                {
+                    "clause_type": "IP",
+                    "text": "本项目产生的知识产权归乙方所有。",
+                    "extract_method": "RULE",
+                    "start_block_index": 0,
+                    "end_block_index": 0,
+                }
+            ],
+            "metadata": [],
+        },
+    )
+    assert document.status_code == 201
+    assert document.json()["current_stage"] == "CLAUSED"
+
+    assert _post(client, fresh_task, [_risk()]).status_code == 201
+
+
 def test_a_missing_task_is_a_404(client: TestClient) -> None:
     response = _post(client, 2**40, [_risk()])
 
