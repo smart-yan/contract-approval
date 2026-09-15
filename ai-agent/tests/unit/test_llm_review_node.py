@@ -19,14 +19,34 @@ from app.core.errors import AgentErrorCode
 from app.graph.context import ReviewContext
 from app.graph.nodes.llm_review import llm_review
 from app.graph.state import ContractReviewState
+from app.llm.finding_resolution import ResolvedFinding
 from app.llm.findings import LLMFinding, LLMReviewResult
 from app.llm.json_guard import LLMSchemaInvalidError
 from app.llm.provider import LLMProvider, LLMUnavailableError
 from app.llm.schemas import LLMRequest, LLMResult
-from app.rules.schemas import RuleRisk
+from app.rules.schemas import AgentRule, RuleRisk, RuleSetSnapshot
 from app.schemas.understanding import Clause
 from app.understanding.clauses import identify_clauses
+from app.understanding.locator import ANCHOR_CLAUSE_FALLBACK, ANCHOR_CLAUSE_SCOPED
 from tests.factories import make_parse_result, para
+
+#: 供 ``related_rule_code`` 核对用的规则快照（只有一条规则）
+PURCHASE_SNAPSHOT = RuleSetSnapshot(
+    contract_type="PURCHASE",
+    rule_set_version="v1",
+    rules=[
+        AgentRule(
+            rule_code="IP_OWNER_SUPPLIER_001",
+            rule_name="知识产权归属相对方",
+            dimension="知识产权",
+            rule_type="KEYWORD",
+            expression={"keywords": ["知识产权归乙方"], "logic": "ANY"},
+            target_clause_types=["IP"],
+            severity="HIGH",
+            sort_order=10,
+        )
+    ],
+)
 
 #: 模块对象（``nodes/__init__.py`` 重导出了同名函数，字符串 monkeypatch 会指到函数上）
 _LLM_REVIEW_MODULE = import_module("app.graph.nodes.llm_review")
@@ -85,6 +105,10 @@ def _clauses(*texts: str) -> list[Clause]:
     return identify_clauses(make_parse_result(*[para(text) for text in texts]))
 
 
+def _parsed(*texts: str) -> Any:
+    return make_parse_result(*[para(text) for text in texts])
+
+
 def _risk(**overrides: Any) -> RuleRisk:
     payload: dict[str, Any] = {
         "risk_code": "IP_OWNER_SUPPLIER_001",
@@ -101,10 +125,17 @@ def _risk(**overrides: Any) -> RuleRisk:
 
 
 def _state(**overrides: Any) -> ContractReviewState:
+    """一份**自洽**的 State：``clauses`` 与 ``parse_result`` 来自同一份文档。
+
+    定位需要段落序列（P9-7），所以两者必须同源 —— 手拼一个只有 clauses 的
+    State 会造出生产里不可能出现的输入。
+    """
+    parsed = _parsed(*DOCUMENT)
     state: dict[str, Any] = {
         "file_id": 7,
         "contract_type": "PURCHASE",
-        "clauses": _clauses(*DOCUMENT),
+        "parse_result": parsed,
+        "clauses": identify_clauses(parsed),
     }
     state.update(overrides)
     return state
@@ -131,10 +162,11 @@ async def test_writes_findings_into_state() -> None:
     updates = await _run(_state(), provider)
 
     assert set(updates) == {"llm_findings"}, "只写这一个键，不污染其它 State 字段"
-    (finding,) = updates["llm_findings"]
-    assert isinstance(finding, LLMFinding)
-    assert finding.risk_title == "知识产权归属相对方"
-    assert finding.risk_level == "HIGH"
+    (resolved,) = updates["llm_findings"]
+    assert isinstance(resolved, ResolvedFinding), "P9-7 起存的是**已定位**的发现"
+    assert isinstance(resolved.finding, LLMFinding)
+    assert resolved.finding.risk_title == "知识产权归属相对方"
+    assert resolved.finding.risk_level == "HIGH"
 
 
 async def test_node_calls_the_service_exactly_once() -> None:
@@ -157,7 +189,127 @@ async def test_findings_order_is_preserved() -> None:
 
     updates = await _run(_state(), FakeProvider(findings=findings))
 
-    assert [f.risk_title for f in updates["llm_findings"]] == ["A", "B"]
+    assert [item.finding.risk_title for item in updates["llm_findings"]] == ["A", "B"]
+
+
+# --------------------------------------------------------------------------- #
+# P9-7：findings 必须经过 P9-4 的落地解析
+# --------------------------------------------------------------------------- #
+async def test_node_delegates_resolution_to_the_p9_4_resolver(monkeypatch) -> None:
+    """节点**调用** ``resolve_findings``，参数就是 State 里那几样东西。
+
+    节点自己搜 quote 就等于造出第二个定位实现 —— 那条路迟早与 P9-3 漂移。
+    """
+    calls: list[dict[str, Any]] = []
+    real_resolve = _LLM_REVIEW_MODULE.resolve_findings
+
+    def spy(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return real_resolve(**kwargs)
+
+    monkeypatch.setattr(_LLM_REVIEW_MODULE, "resolve_findings", spy)
+
+    state = _state(rule_risks=[_risk()], rule_snapshot=PURCHASE_SNAPSHOT)
+    await _run(state, FakeProvider(findings=[GOOD_FINDING]))
+
+    (kwargs,) = calls
+    assert [f.risk_title for f in kwargs["findings"]] == ["知识产权归属相对方"]
+    assert kwargs["clauses"] == state["clauses"]
+    assert kwargs["paragraphs"] == state["parse_result"].paragraphs
+    assert kwargs["known_rule_codes"] == {"IP_OWNER_SUPPLIER_001"}, "核对依据来自规则快照"
+
+
+def test_state_annotation_matches_what_the_node_writes() -> None:
+    """State 里 ``llm_findings`` 的**元素类型**必须与节点真正写进去的一致。
+
+    LangGraph 不会替我们校验 TypedDict 的注解 —— 注解写 ``LLMFinding`` 而实际写
+    ``ResolvedFinding`` 不会有任何报错，只有读代码的人会被误导。这条断言把它钉住。
+    """
+    import typing
+
+    annotation = typing.get_type_hints(ContractReviewState)["llm_findings"]
+
+    assert annotation == list[ResolvedFinding]
+
+
+async def test_quote_is_resolved_to_a_paragraph_index() -> None:
+    """模型给的 quote 变成文档里真实的段落号（P9-3 的定位能力）。"""
+    updates = await _run(_state(), FakeProvider(findings=[GOOD_FINDING]))
+
+    (resolved,) = updates["llm_findings"]
+    assert resolved.paragraph_index == 1
+    assert resolved.anchor_method == ANCHOR_CLAUSE_SCOPED
+
+
+async def test_location_fields_are_all_preserved() -> None:
+    updates = await _run(_state(), FakeProvider(findings=[GOOD_FINDING]))
+
+    (resolved,) = updates["llm_findings"]
+    assert resolved.original_text == "本项目产生的知识产权归乙方所有。"
+    assert resolved.quote == "知识产权归乙方所有"
+    assert resolved.quote in resolved.original_text, "证据必须能在原文里找到"
+
+
+async def test_invalid_clause_index_drops_that_finding(caplog) -> None:
+    """clause_index 站不住 → **丢弃那一条**（P9-4 的规则），并且**要留下 warning**。"""
+    findings = [GOOD_FINDING, dict(GOOD_FINDING, clause_index=99, risk_title="越界的")]
+
+    with caplog.at_level("WARNING"):
+        updates = await _run(_state(), FakeProvider(findings=findings))
+
+    assert [item.finding.risk_title for item in updates["llm_findings"]] == ["知识产权归属相对方"]
+    assert any("clause_index=99" in record.getMessage() for record in caplog.records)
+
+
+async def test_unknown_related_rule_code_is_cleared_but_the_finding_survives() -> None:
+    finding = dict(GOOD_FINDING, related_rule_code="NOT_A_REAL_RULE")
+
+    updates = await _run(_state(rule_snapshot=PURCHASE_SNAPSHOT), FakeProvider(findings=[finding]))
+
+    (resolved,) = updates["llm_findings"]
+    assert resolved.finding.related_rule_code is None, "核不上的关联一律清空"
+    assert resolved.paragraph_index == 1, "风险本身保留"
+
+
+async def test_known_related_rule_code_survives() -> None:
+    """快照里**有**这个 rule_code 时才保留关联 —— 证明快照真的被读到了。"""
+    finding = dict(GOOD_FINDING, related_rule_code="IP_OWNER_SUPPLIER_001")
+
+    updates = await _run(_state(rule_snapshot=PURCHASE_SNAPSHOT), FakeProvider(findings=[finding]))
+
+    assert updates["llm_findings"][0].finding.related_rule_code == "IP_OWNER_SUPPLIER_001"
+
+
+async def test_missing_rule_snapshot_clears_every_relation() -> None:
+    """上游没给出规则快照 → 一个关联都不接受（保守方向），但审查照常完成。"""
+    finding = dict(GOOD_FINDING, related_rule_code="IP_OWNER_SUPPLIER_001")
+
+    updates = await _run(_state(), FakeProvider(findings=[finding]))
+
+    assert updates["llm_findings"][0].finding.related_rule_code is None
+
+
+async def test_unlocatable_quote_keeps_the_finding_with_a_fallback_anchor() -> None:
+    """quote 在文档里找不到 → **保留**、降级到条款级（P9-4 的 fallback 语义）。"""
+    finding = dict(GOOD_FINDING, quote="这句话文档里没有")
+
+    updates = await _run(_state(), FakeProvider(findings=[finding]))
+
+    (resolved,) = updates["llm_findings"]
+    assert resolved.anchor_method == ANCHOR_CLAUSE_FALLBACK
+    assert resolved.paragraph_index == 0, "锚在目标条款的首个有效段落"
+    assert resolved.quote == resolved.original_text, "降级时证据取回退段落的原文"
+    assert resolved.finding.risk_title == "知识产权归属相对方", "风险不能丢"
+
+
+async def test_state_is_not_modified_in_place() -> None:
+    """输入 State（含 clauses / parse_result）在求值前后一模一样。"""
+    state = _state(rule_risks=[_risk()], rule_snapshot=PURCHASE_SNAPSHOT)
+    before = {key: value for key, value in state.items()}
+
+    await _run(state, FakeProvider(findings=[GOOD_FINDING]))
+
+    assert state == before
 
 
 # --------------------------------------------------------------------------- #
@@ -311,7 +463,10 @@ async def test_node_delegates_to_the_service(monkeypatch) -> None:
     assert len(calls) == 1
     assert calls[0].contract_type == "PURCHASE"
     assert [c.clause_index for c in calls[0].clauses] == [0, 1]
-    assert updates["llm_findings"] == [sentinel]
+    # 服务给的是哨兵 finding；节点随后把它交给**真实的** resolve_findings 落地
+    (resolved,) = updates["llm_findings"]
+    assert resolved.finding == sentinel
+    assert resolved.paragraph_index == 1, "哨兵的 quote 落在文档第 1 段"
 
 
 def _imported_modules() -> set[str]:
@@ -348,8 +503,11 @@ def test_node_only_depends_on_the_service_and_failure_types() -> None:
         "app.graph.context",
         "app.graph.state",
         "app.llm.clause_review",
+        "app.llm.finding_resolution",
         "app.llm.findings",
         "app.llm.json_guard",
+        "app.schemas.document",
+        "app.understanding.locator",
         "app.llm.provider",
     }
 

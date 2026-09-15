@@ -39,7 +39,7 @@ from __future__ import annotations
 
 from typing import TypedDict
 
-from app.llm.findings import LLMFinding
+from app.llm.finding_resolution import ResolvedFinding
 from app.rules.schemas import RuleEvaluationResult, RuleRisk, RuleSetSnapshot
 from app.schemas.document import ParseResult
 from app.schemas.understanding import Clause, KeywordHit, MetadataItem
@@ -97,12 +97,16 @@ class ContractReviewState(TypedDict, total=False):
     rule_risks: list[RuleRisk]
 
     # -------------------------------- llm ------------------------------- #
-    #: llm_review：模型报出的发现（P9-5）。
-    #: ⚠️ 它们是**模型的原始发现**，不是风险项 —— 还没做定位（P9-3/P9-4 的能力
-    #: 尚未接进节点）、没有 ``source`` 也没有最终段落号。
+    #: llm_review：**已定位**的模型发现（P9-7 起）。
+    #: 元素是 :class:`~app.llm.finding_resolution.ResolvedFinding` ——
+    #: 模型的说法（``.finding``）**加上** Agent 核出来的位置
+    #: （``paragraph_index`` / ``original_text`` / ``quote`` / ``anchor_method``）。
+    #:
+    #: ⚠️ 字段名保留 ``llm_findings``（本轮不改名），但它**不是风险项**：
+    #: 没有 ``source``、没有与规则结果的合并、没有评分。
     #: 与规则侧同理：模型跑失败时这里**保持缺失**，不写空列表
     #: （空列表会被读成"模型看了，没发现问题"）
-    llm_findings: list[LLMFinding]
+    llm_findings: list[ResolvedFinding]
 
     #: LLM 审查的**降级**信号（P9-6a）。刻意**不**写进 ``error_code``：
     #: §9.1 第 4 道防线规定"本批降级为**仅规则引擎结果**并在任务上标记 warning，

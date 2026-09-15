@@ -37,6 +37,7 @@ from app.llm.provider import LLMProvider, LLMUnavailableError
 from app.llm.schemas import LLMRequest, LLMResult
 from app.rules.schemas import AgentRule, RuleSetSnapshot
 from app.tools.backend_client import BackendClient
+from app.understanding.locator import ANCHOR_CLAUSE_SCOPED
 from tests.factories import docx_bytes
 
 BACKEND_BASE_URL = "http://backend.test"
@@ -191,7 +192,11 @@ async def test_successful_llm_review_writes_findings(
     final = await _run(make_backend(_ok_handler()), source_file, provider)
 
     assert len(final["llm_findings"]) == 1
-    assert final["llm_findings"][0].risk_title == "知识产权归属供方"
+    (resolved,) = final["llm_findings"]
+    assert resolved.finding.risk_title == "知识产权归属供方"
+    assert resolved.paragraph_index == 1, "P9-7：真实文档里定位到第 1 段"
+    assert resolved.anchor_method == ANCHOR_CLAUSE_SCOPED
+    assert resolved.quote in resolved.original_text
     assert final.get("llm_error_code") is None
     assert final.get("error_code") is None, "LLM 成功不该产生任何失败信号"
     # 规则结果照旧（两条通道互不影响）
@@ -214,14 +219,20 @@ async def test_successful_llm_review_receives_clauses_and_rule_hits(
 async def test_model_findings_are_not_touched_by_the_rule_side(
     make_backend: Callable[[Handler], BackendClient], source_file: Path
 ) -> None:
-    """``llm_findings`` 是模型的原始发现 —— 不被规则结果污染。"""
+    """``llm_findings`` 带着**定位**（P9-7），但**仍然不是风险项**。
+
+    分工要看得清：``ResolvedFinding`` 有段落号（Agent 核出来的），
+    而里面的 ``LLMFinding`` 只有模型说的话 —— 没有段落号、没有 ``source``、
+    没有风险等级以外的加工。合并与统一风险模型是后续步骤的事。
+    """
     provider = FakeProvider(findings=[GOOD_FINDING])
 
     final = await _run(make_backend(_ok_handler()), source_file, provider)
 
-    finding = final["llm_findings"][0]
-    assert not hasattr(finding, "paragraph_index")
-    assert not hasattr(finding, "source")
+    resolved = final["llm_findings"][0]
+    assert hasattr(resolved, "paragraph_index"), "P9-7：定位结果在这一层"
+    assert not hasattr(resolved.finding, "paragraph_index"), "模型不产出坐标系"
+    assert not hasattr(resolved.finding, "source")
 
 
 # --------------------------------------------------------------------------- #

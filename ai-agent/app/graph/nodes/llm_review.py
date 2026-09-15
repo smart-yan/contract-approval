@@ -1,37 +1,36 @@
-"""``llm_review`` 节点 —— 编排"让模型审一遍条款"这一步（P9-5 骨架）。
+"""``llm_review`` 节点 —— 编排"让模型审一遍条款，并把它的说法落到文档上"（P9-5 / P9-7）。
 
 调用链
 -----
 ::
 
     llm_review Node                →  llm.clause_review.review_clauses()
-    （State 编解码 + 组装输入）        （业务层：提示 + Provider + 校验）
+    （State 编解码 + 组装输入）        （业务层：提示 + Provider + JSON Guard）
+                                   →  llm.finding_resolution.resolve_findings()
+                                      （业务层：定位 + related_rule_code 核对）
 
 节点**只做 State 编解码**，与 ``identify_clauses`` / ``rule_review`` 同构：
 
-* 从 State 里取出**已有的**条款与规则命中，组装成 :class:`ClauseReviewPromptInput`
-* 调用业务层的 :func:`~app.llm.clause_review.review_clauses`
-* 把拿回来的 findings 写进 ``llm_findings``
+* 从 State 里取出**已有的**条款、规则命中、段落序列与规则快照，组装输入
+* 调用业务层的两个纯函数式能力（审查调用 + 落地解析）
+* 把结果写进 ``llm_findings``
+* 把失败翻译成明确的 State 状态
 
-它**不**自己拼提示、不自己拼 JSON Schema、不碰 HTTP、不解析 JSON ——
-那些分别是 ``prompts`` / ``json_guard`` / ``provider`` 的职责。
-节点里若出现第二套提示或第二份 schema，两边就会各自漂移。
+它**不**自己拼提示、不自己拼 JSON Schema、不碰 HTTP、不解析 JSON、
+**也不自己搜 quote** —— 那些分别是 ``prompts`` / ``json_guard`` / ``provider`` /
+``understanding.locator`` 的职责。节点里若出现第二套提示、第二份 schema
+或第二个定位实现，就会开始各自漂移。
 
-写进 State 的是**模型的原始发现**
--------------------------------
-``llm_findings`` 里的元素是 :class:`~app.llm.findings.LLMFinding`：
-只有"模型说了什么 + 它自己给的 ``clause_index`` / ``quote``"，
-**没有**段落号、没有 ``source``、没有风险等级以外的加工。
-定位（P9-3/P9-4）与合并（后续）是它们各自独立的一步 ——
-本节点不提前替它们做决定。
+``llm_findings`` 里装的是**已定位**的发现（P9-7 起）
+-------------------------------------------------
+元素是 :class:`~app.llm.finding_resolution.ResolvedFinding`：
+模型的说法（``.finding``）**加上** Agent 核出来的位置
+（``paragraph_index`` / ``original_text`` / ``quote`` / ``anchor_method``）。
 
-⚠️ 本节点**尚未接入 Graph builder**（刻意的）
-------------------------------------------
-接上去以后，每一次真实审查都会跑到它，而端点的 ``ReviewContext`` 目前
-**没有注入 LLM provider** —— 结果是所有真实请求都会被判成 ``LLM_UNAVAILABLE``
-失败（``_to_response`` 会把 ``error_code`` 表达成 rejected）。
-"什么时候开始要求 LLM、没配 provider 时整个流程该怎么办"是**接线那一步的裁决**，
-不在本步（本步只建立节点的输入/输出契约）。
+字段名仍然叫 ``llm_findings``（本步**不改名**），但它的语义已经推进了一步：
+不再是"模型说了什么"，而是"模型说了什么，且我们能指出它在文档的哪一段"。
+⚠️ 它**仍然不是风险项** —— 没有 ``source``、没有合并、没有等级加工，
+那些是后续步骤的事。
 
 失败语义（P9-6a 起：LLM 失败是**降级**，不是整次审查失败）
 ------------------------------------------------------
@@ -45,8 +44,9 @@ warning，绝不让整个任务失败"。LLM 挂了的时候规则结果仍然�
 的审查被说成失败，既不准确，也会让人以为整个任务白跑了。
 两条通道各有各的分流（见 ``route_after_llm_review``）。
 
-唯一的**致命**失败仍然是输入缺失（``contract_type`` 为空）：那种情况下这个节点
-根本组不出提示，而且 ``upload_file`` 早就该拦住了。
+唯一的**致命**失败仍然是输入缺失（``contract_type`` 或 ``parse_result``）：
+那种情况下这个节点根本组不出提示、也没有段落可定位，
+而且 ``upload_file`` / ``parse_document`` 早就该拦住了。
 """
 
 from __future__ import annotations
@@ -59,9 +59,12 @@ from app.core.errors import AgentErrorCode
 from app.graph.context import ReviewContext
 from app.graph.state import ContractReviewState
 from app.llm.clause_review import review_clauses
+from app.llm.finding_resolution import resolve_findings
 from app.llm.findings import ClauseContext, ClauseReviewPromptInput, MatchedRuleHint
 from app.llm.json_guard import LLMSchemaInvalidError
 from app.llm.provider import LLMUnavailableError
+from app.schemas.document import Paragraph
+from app.understanding.locator import ANCHOR_CLAUSE_FALLBACK
 
 logger = logging.getLogger(__name__)
 
@@ -70,10 +73,12 @@ async def llm_review(
     state: ContractReviewState,
     runtime: Runtime[ReviewContext],
 ) -> dict[str, object]:
-    """让模型审一遍本批条款，把 findings 写回 State。
+    """让模型审一遍本批条款，把 findings **落到文档上**后写回 State。
 
-    * 读 State：``contract_type`` / ``clauses`` / ``rule_risks``
-    * 写 State：``llm_findings``；失败时 ``error_code`` / ``error_message``
+    * 读 State：``contract_type`` / ``clauses`` / ``parse_result`` / ``rule_risks`` /
+      ``rule_snapshot``
+    * 写 State：``llm_findings``（已定位的发现）；失败时走降级通道
+      ``llm_error_code`` / ``llm_error_message``
 
     **不抛业务异常**：两类 LLM 失败都翻译成明确的错误状态（见模块 docstring）。
     """
@@ -86,11 +91,14 @@ async def llm_review(
         logger.warning("llm_review 降级 | %s", message)
         return {"llm_error_code": AgentErrorCode.LLM_UNAVAILABLE.value, "llm_error_message": message}
 
-    contract_type = state.get("contract_type")
-    if not contract_type:
-        message = "缺少 Workflow 必需输入：contract_type（没有它无法确定审查视角）"
+    missing = [name for name in ("contract_type", "parse_result") if not state.get(name)]
+    if missing:
+        # 没有这些就既组不出提示、也没有段落可定位 —— 真正的输入缺失
+        message = f"缺少 Workflow 必需输入：{', '.join(missing)}"
         logger.warning("llm_review 输入不完整 | %s", message)
         return {"error_code": AgentErrorCode.AGENT_INPUT_INVALID.value, "error_message": message}
+
+    contract_type = state["contract_type"]
 
     clauses = state.get("clauses") or []
     if not clauses:
@@ -110,22 +118,60 @@ async def llm_review(
         logger.warning("llm_review 降级（输出不合契约）| file_id=%s %s", state.get("file_id"), exc)
         return {"llm_error_code": exc.error_code, "llm_error_message": str(exc)}
 
+    # ---- 落地解析：模型的说法 → 文档里**真实存在**的位置（P9-7 接入）----
+    # 复用 P9-4 的 resolve_findings（节点不自己搜 quote）：
+    #   clause_index 站不住 → 丢弃那一条；quote 定位不唯一 → 降级到条款级；
+    #   related_rule_code 核不上 → 清空关联。三条规则各自写 warning（在 resolver 里）。
+    resolved = resolve_findings(
+        findings=outcome.review.findings,
+        clauses=clauses,
+        paragraphs=_paragraphs_of(state),
+        known_rule_codes=_known_rule_codes(state),
+    )
+
+    fallback_count = sum(1 for item in resolved if item.anchor_method == ANCHOR_CLAUSE_FALLBACK)
     logger.info(
-        "llm_review 完成 | file_id=%s clauses=%d findings=%d model=%s tokens=%d/%d latency_ms=%d",
+        "llm_review 完成 | file_id=%s clauses=%d findings=%d resolved=%d dropped=%d fallback=%d "
+        "model=%s tokens=%d/%d latency_ms=%d",
         state.get("file_id"),
         len(clauses),
         len(outcome.review.findings),
+        len(resolved),
+        len(outcome.review.findings) - len(resolved),
+        fallback_count,
         outcome.llm.model,
         outcome.llm.prompt_tokens,
         outcome.llm.completion_tokens,
         outcome.llm.latency_ms,
     )
-    return {"llm_findings": outcome.review.findings}
+    return {"llm_findings": resolved}
 
 
 # --------------------------------------------------------------------------- #
 # 内部
 # --------------------------------------------------------------------------- #
+def _paragraphs_of(state: ContractReviewState) -> list[Paragraph]:
+    """定位要用的段落序列。
+
+    ``ParseResult.paragraphs`` 是 P6-2 的位置契约本体 —— 段落序号只有回到它身上
+    才能变成"真实的第几段"。解析没跑过时上面那道必需输入守卫已经拦住了，
+    这里只是把它取出来（``clauses`` 与它同源，本来就分不开）。
+    """
+    parse_result = state.get("parse_result")
+    return parse_result.paragraphs if parse_result is not None else []
+
+
+def _known_rule_codes(state: ContractReviewState) -> set[str]:
+    """本次审查所用规则快照里的全部 ``rule_code``（供核对 ``related_rule_code``）。
+
+    快照缺失（例如上游 ``rule_review`` 已经失败）时返回**空集合** ——
+    于是一个关联都不会被接受（P9-4 的保守口径：没有依据的关联一律清空）。
+    这里**不报错**：LLM 审查本身仍然可以照常进行，只是不建立任何规则关联。
+    """
+    snapshot = state.get("rule_snapshot")
+    return {rule.rule_code for rule in snapshot.rules} if snapshot is not None else set()
+
+
 def _build_payload(
     state: ContractReviewState, *, contract_type: str, clauses: list
 ) -> ClauseReviewPromptInput:
