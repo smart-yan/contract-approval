@@ -95,6 +95,8 @@ def test_only_approved_business_routes_are_mounted(app: FastAPI) -> None:
     * P11-4 ``/api/v1/review-tasks/{task_id}/workbench`` —— 工作台查询
       （一次取齐合同 / 原文 / 条款 / 元数据 / 风险；P11-3 的 ``/api/v1/contracts``
       是同一个路径上新增的 GET，白名单按**路径**比较，因此不受影响）
+    * P12-3 ``/api/v1/review-tasks/{task_id}/report/export`` —— 报告导出
+      （只读投影 → Markdown，无副作用；不建 ``report`` 表，因此没有第二个路由）
     """
     approved = {
         "/api/v1/contracts",
@@ -102,6 +104,7 @@ def test_only_approved_business_routes_are_mounted(app: FastAPI) -> None:
         "/api/v1/review-tasks/{task_id}/risks",
         "/api/v1/review-tasks/{task_id}/document",
         "/api/v1/review-tasks/{task_id}/workbench",
+        "/api/v1/review-tasks/{task_id}/report/export",
     }
 
     paths = set(app.openapi()["paths"])
