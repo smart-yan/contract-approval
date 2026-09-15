@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 from app.api import review_router
 from app.core.config import get_settings
 from app.graph.builder import build_review_graph
+from app.llm.provider import DeepSeekProvider
 from app.tools.backend_client import BackendClient
 
 APP_VERSION = "0.1.0"
@@ -53,13 +54,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     _configure_logging(settings.log_level)
 
-    # 进程级共享资源：一个 HTTP 连接池 + 一份编译好的 Graph。
-    # 两者都是无状态/可复用的，放进 app.state 由 lifespan 统一管理生命周期，
+    # 进程级共享资源：一个 HTTP 连接池 + 一个 LLM provider + 一份编译好的 Graph。
+    # 都是无状态/可复用的，放进 app.state 由 lifespan 统一管理生命周期，
     # 避免每个请求各自新建连接池。
     app.state.backend_client = BackendClient(
         settings.backend_base_url,
         timeout_seconds=settings.backend_timeout_seconds,
     )
+    # LLM provider 在这里**无条件**创建：构造它不发任何请求，
+    # 未配置密钥时 ``complete()`` 会在本地短路（见 DeepSeekProvider），
+    # 于是图里的 ``llm_review`` 会走**降级**分支而不是报错。
+    app.state.llm_provider = DeepSeekProvider(settings)
     app.state.review_graph = build_review_graph()
 
     logger.info("AI Agent 服务启动中 | %s", settings.safe_summary())
@@ -67,6 +72,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # 只关闭自己创建的资源；图是纯内存对象，无需释放
     await app.state.backend_client.aclose()
+    await app.state.llm_provider.aclose()
     logger.info("AI Agent 服务关闭")
 
 

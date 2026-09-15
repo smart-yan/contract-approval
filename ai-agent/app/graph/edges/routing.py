@@ -24,6 +24,11 @@ from app.graph.state import ContractReviewState, has_usable_document
 #: 两个分支名，供 ``path_map`` 映射到真实节点
 RouteBranch = Literal["continue", "stop"]
 
+#: ``llm_review`` 之后的分支名（P9-6a）。
+#: ``fallback`` = "只用规则结果继续" —— **不是**结束，两条路都会往下走，
+#: 只是带着不同的东西（见 :func:`route_after_llm_review`）。
+LLMRouteBranch = Literal["continue", "fallback"]
+
 
 def route_after_validate(state: ContractReviewState) -> RouteBranch:
     """校验通过则继续解析，否则结束。
@@ -53,4 +58,32 @@ def route_after_parse(state: ContractReviewState) -> RouteBranch:
     return "continue" if has_usable_document(state) else "stop"
 
 
-__all__ = ["RouteBranch", "route_after_parse", "route_after_validate"]
+def route_after_llm_review(state: ContractReviewState) -> LLMRouteBranch:
+    """LLM 审查有结论就正常走，降级就走去掉 LLM 结论的那条路。
+
+    判断依据只有 ``llm_review`` 写在**降级通道**上的 ``llm_error_code``
+    （不是整次审查的 ``error_code``）—— LLM 挂了不代表这次审查白跑：
+    ``rule_risks`` 仍然完整可用（§9.1：降级为"仅规则引擎结果"）。
+
+    两条路**都继续往下走**，区别是后续节点该不该指望 ``llm_findings``：
+    ``continue`` 有模型结论，``fallback`` 只有规则结果。
+
+    ``llm_error_code`` 缺失（节点没跑 / 键名写错）时走 ``fallback`` ——
+    与其它路由一致，**fail-closed**：没确凿拿到 LLM 结论，就不能按"有结论"往下走。
+    （"缺失"不只是"没有错误码"：``llm_findings`` 本身不在 State 里同样说明节点没跑过，
+    那时也必须是 fallback —— 否则后续节点会去找一份**根本不存在**的模型结论。）
+    """
+    if state.get("llm_error_code"):
+        return "fallback"
+    if state.get("llm_findings") is None:
+        return "fallback"
+    return "continue"
+
+
+__all__ = [
+    "LLMRouteBranch",
+    "RouteBranch",
+    "route_after_llm_review",
+    "route_after_parse",
+    "route_after_validate",
+]

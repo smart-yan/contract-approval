@@ -21,7 +21,7 @@ from app.graph.nodes.llm_review import llm_review
 from app.graph.state import ContractReviewState
 from app.llm.findings import LLMFinding, LLMReviewResult
 from app.llm.json_guard import LLMSchemaInvalidError
-from app.llm.provider import LLMUnavailableError
+from app.llm.provider import LLMProvider, LLMUnavailableError
 from app.llm.schemas import LLMRequest, LLMResult
 from app.rules.schemas import RuleRisk
 from app.schemas.understanding import Clause
@@ -54,12 +54,16 @@ GOOD_FINDING: dict[str, Any] = {
 # 替身
 # --------------------------------------------------------------------------- #
 class FakeProvider:
-    """只实现 ``LLMProvider`` 协议：记录请求，返回预设结果或抛预设异常。"""
+    """只实现 ``LLMProvider`` 协议：记录请求，返回预设结果或抛预设异常。
+
+    ``aclose()`` 是协议的一部分（应用级生命周期），替身同样要有。
+    """
 
     def __init__(
         self, *, findings: list[dict[str, Any]] | None = None, error: Exception | None = None
     ) -> None:
         self.requests: list[LLMRequest] = []
+        self.closed = False
         self._raw = json.dumps({"findings": findings if findings is not None else []}, ensure_ascii=False)
         self._error = error
 
@@ -68,6 +72,9 @@ class FakeProvider:
         if self._error is not None:
             raise self._error
         return LLMResult(raw_text=self._raw, model="fake-model", provider="fake", latency_ms=3)
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 class _FakeBackend:
@@ -106,6 +113,13 @@ def _state(**overrides: Any) -> ContractReviewState:
 async def _run(state: ContractReviewState, provider: FakeProvider | None) -> dict[str, object]:
     context = ReviewContext(backend=_FakeBackend(), llm=provider)
     return await llm_review(state, Runtime(context=context))
+
+
+# --------------------------------------------------------------------------- #
+# 替身符合协议
+# --------------------------------------------------------------------------- #
+def test_double_satisfies_the_provider_protocol() -> None:
+    assert isinstance(FakeProvider(), LLMProvider)
 
 
 # --------------------------------------------------------------------------- #
@@ -204,11 +218,13 @@ async def test_node_does_not_touch_the_input_state() -> None:
 # --------------------------------------------------------------------------- #
 # 失败语义：记录成明确状态，既不吞也不炸
 # --------------------------------------------------------------------------- #
-async def test_missing_provider_is_recorded_not_crashed() -> None:
+async def test_missing_provider_is_a_degradation_not_a_failure() -> None:
+    """没注入 provider = **降级**：规则结果照常可用，整次审查不算失败。"""
     updates = await _run(_state(), None)
 
-    assert updates["error_code"] == AgentErrorCode.LLM_UNAVAILABLE.value
-    assert "provider" in updates["error_message"]
+    assert updates["llm_error_code"] == AgentErrorCode.LLM_UNAVAILABLE.value
+    assert "provider" in updates["llm_error_message"]
+    assert "error_code" not in updates, "降级不该占用整次审查的失败通道"
     assert "llm_findings" not in updates
 
 
@@ -222,28 +238,30 @@ async def test_missing_contract_type_is_recorded() -> None:
     assert "contract_type" in updates["error_message"]
 
 
-async def test_model_unavailable_is_recorded_into_state() -> None:
-    """模型不可用 → State 里的错误状态（**不冒泡**，也不写一个空结论冒充成功）。"""
+async def test_model_unavailable_goes_to_the_degradation_channel() -> None:
+    """模型不可用 → **降级通道**（**不冒泡**，也不写一个空结论冒充成功）。"""
     provider = FakeProvider(error=LLMUnavailableError("LLM 返回 503", status_code=503))
 
     updates = await _run(_state(), provider)
 
-    assert updates["error_code"] == AgentErrorCode.LLM_UNAVAILABLE.value
-    assert "503" in updates["error_message"]
+    assert updates["llm_error_code"] == AgentErrorCode.LLM_UNAVAILABLE.value
+    assert "503" in updates["llm_error_message"]
+    assert "error_code" not in updates
     assert "llm_findings" not in updates, "失败时不能留下一个可被读成'没问题'的空列表"
 
 
-async def test_invalid_schema_is_recorded_into_state() -> None:
+async def test_invalid_schema_goes_to_the_degradation_channel() -> None:
     provider = FakeProvider(error=LLMSchemaInvalidError("模型输出不是合法 JSON"))
 
     updates = await _run(_state(), provider)
 
-    assert updates["error_code"] == AgentErrorCode.LLM_SCHEMA_INVALID.value
+    assert updates["llm_error_code"] == AgentErrorCode.LLM_SCHEMA_INVALID.value
+    assert "error_code" not in updates
     assert "llm_findings" not in updates
 
 
 async def test_bad_json_from_the_model_never_reaches_state_as_findings() -> None:
-    """模型回了一段人话 —— 校验失败进错误状态，**不会**变成"零风险"。"""
+    """模型回了一段人话 —— 校验失败进降级通道，**不会**变成"零风险"。"""
 
     class ChattyProvider(FakeProvider):
         async def complete(self, request: LLMRequest) -> LLMResult:
@@ -252,7 +270,7 @@ async def test_bad_json_from_the_model_never_reaches_state_as_findings() -> None
 
     updates = await _run(_state(), ChattyProvider())
 
-    assert updates["error_code"] == AgentErrorCode.LLM_SCHEMA_INVALID.value
+    assert updates["llm_error_code"] == AgentErrorCode.LLM_SCHEMA_INVALID.value
     assert "llm_findings" not in updates
 
 
@@ -378,13 +396,10 @@ def test_node_imports_the_service_to_call_it() -> None:
     assert "review_clauses" in called
 
 
-def test_node_is_not_wired_into_the_graph_yet() -> None:
-    """本步刻意**不接** builder：接上去会让每一次真实审查都被判成 LLM_UNAVAILABLE。
-
-    （端点尚未注入 provider，"什么时候开始要求 LLM"是接线那一步的裁决。）
-    """
+def test_node_is_wired_into_the_graph() -> None:
+    """P9-6a 起已接入：``rule_review → llm_review → 条件边``。"""
     from app.graph import builder
 
     names = builder.build_review_graph().get_graph().nodes
 
-    assert "llm_review" not in names
+    assert builder.NODE_LLM_REVIEW in names

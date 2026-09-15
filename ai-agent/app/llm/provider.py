@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 import httpx
 
@@ -70,16 +70,39 @@ class LLMUnavailableError(Exception):
         self.error_code = error_code or AgentErrorCode.LLM_UNAVAILABLE.value
 
 
+@runtime_checkable
 class LLMProvider(Protocol):
-    """LLM 提供方接口。
+    """LLM 提供方接口 —— **应用级生命周期契约**。
 
     目前只有 :class:`DeepSeekProvider` 一个实现 —— Protocol 的意义不在"多态"，
     而在**把契约钉死**：P9-2 的节点依赖这个形状，将来换模型时业务代码零改动
     （与架构文档 §9.1「LLMFactory.build(settings) 按配置切换」同一目标）。
+
+    契约包含**两个**方法，缺一不可：
+
+    * :meth:`complete` —— 调用模型（业务用）
+    * :meth:`aclose` —— 释放连接池（**应用用**：``lifespan`` 关闭时会调它）
+
+    为什么 ``aclose`` 也要写进 Protocol：它不属于"某个实现顺带的便利方法"，
+    而是**每个 provider 都必须满足的生命周期约定**。只声明 ``complete`` 的话，
+    "provider 必须可关闭"就退化成只在运行时才暴露的口头约定 ——
+    一个漏实现的替身不会在类型检查或断言里被发现，而是在**关闭阶段**炸掉
+    （表现成 teardown 报错，看起来像测试基础设施的问题，不像契约缺失）。
+
+    ``@runtime_checkable`` 让"这个替身符不符合契约"可以被直接断言
+    （它只检查方法存不存在，正是这里需要的粒度）。
     """
 
     async def complete(self, request: LLMRequest) -> LLMResult:
         """执行一次调用。失败时抛 :class:`LLMUnavailableError`。"""
+        ...
+
+    async def aclose(self) -> None:
+        """释放本 provider 持有的资源（HTTP 连接池等）。
+
+        幂等：重复调用不应报错。**只关闭自己创建的东西** ——
+        外部注入的 client 归调用方管（见 :class:`DeepSeekProvider`）。
+        """
         ...
 
 

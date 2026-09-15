@@ -9,6 +9,7 @@ Provider 的职责是传输与封装，把 HTTP 打桩之后，它剩下的每�
 
 from __future__ import annotations
 
+import inspect
 import json
 from collections.abc import AsyncIterator, Callable, Coroutine
 from typing import Any
@@ -21,8 +22,13 @@ from app.core.config import AgentSettings
 from app.core.constants import LLMScene
 from app.core.errors import AgentErrorCode
 from app.llm.json_guard import LLMSchemaInvalidError, parse_and_validate
-from app.llm.provider import PROVIDER_DEEPSEEK, DeepSeekProvider, LLMUnavailableError
-from app.llm.schemas import LLMRequest
+from app.llm.provider import (
+    PROVIDER_DEEPSEEK,
+    DeepSeekProvider,
+    LLMProvider,
+    LLMUnavailableError,
+)
+from app.llm.schemas import LLMRequest, LLMResult
 
 BASE_URL = "https://deepseek.test"
 EXPECTED_URL = f"{BASE_URL}/chat/completions"
@@ -332,3 +338,47 @@ async def test_injected_client_is_not_closed_by_the_provider(make_provider) -> N
     await provider.aclose()
 
     assert provider._client is not None, "注入的 client 不该被 Provider 关掉"
+
+
+async def test_aclose_is_idempotent() -> None:
+    """重复关闭不报错 —— 应用关闭路径可能被走两次（异常退出、测试 teardown）。"""
+    provider = DeepSeekProvider(_settings())
+
+    await provider.aclose()
+    await provider.aclose()
+
+
+# --------------------------------------------------------------------------- #
+# 应用级生命周期契约（P9-6a 修正）
+#
+# 应用不仅在业务里调 ``complete()``，还在关闭时 ``await provider.aclose()``
+# （见 app/main.py 的 lifespan）—— 因此它必须是 **Protocol 的一部分**。
+# --------------------------------------------------------------------------- #
+def test_protocol_declares_the_whole_lifecycle() -> None:
+    """契约包含 **两个** 方法，缺一不可：``complete()`` 与 ``aclose()``。"""
+    methods = {
+        name
+        for name, member in inspect.getmembers(LLMProvider, inspect.isfunction)
+        if not name.startswith("_")  # 忽略 Protocol 自带的 __init__ 等
+    }
+
+    assert methods == {"complete", "aclose"}
+
+
+def test_the_real_provider_satisfies_the_protocol() -> None:
+    assert isinstance(DeepSeekProvider(_settings()), LLMProvider)
+
+
+def test_a_double_missing_aclose_does_not_satisfy_the_protocol() -> None:
+    """这条断言让上面那个检查**有牙齿**：漏掉 ``aclose`` 的替身会被判不合契约。
+
+    真实代价不是"类型不对"，而是**关闭阶段才炸** ——
+    一个看起来像测试基础设施故障、实则契约缺失的错误。
+    """
+
+    class _HalfProvider:
+        async def complete(self, request: LLMRequest) -> LLMResult:  # pragma: no cover - 不会被调用
+            raise NotImplementedError
+
+    assert not isinstance(_HalfProvider(), LLMProvider)
+    assert not isinstance(object(), LLMProvider)

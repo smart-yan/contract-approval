@@ -34,7 +34,13 @@
     rule_review
       │
       ▼
-    END（P9 起这里会接上 LLM 审查与风险合并）
+    llm_review
+      │
+      ├── 条件边 ── fallback ──▶ END（LLM 降级：只带规则结果，
+      │                          后续节点接上后走这里）
+     continue
+      ▼
+    END（带模型结论；风险合并 / 评分在后续阶段接在这里）
 
 ⚠️ **解析后的条件边不是冗余**：它把"解析失败就不该往下走"放在图的结构里。
 P7-1 接入第一个理解层节点时，只需要把 ``continue`` 指向 ``identify_clauses``，
@@ -64,10 +70,11 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
 from app.graph.context import ReviewContext
-from app.graph.edges.routing import route_after_parse, route_after_validate
+from app.graph.edges.routing import route_after_llm_review, route_after_parse, route_after_validate
 from app.graph.nodes.extract_keywords import extract_keywords
 from app.graph.nodes.extract_metadata import extract_metadata
 from app.graph.nodes.identify_clauses import identify_clauses
+from app.graph.nodes.llm_review import llm_review
 from app.graph.nodes.parse_document import parse_document
 from app.graph.nodes.rule_review import rule_review
 from app.graph.nodes.upload_file import upload_file
@@ -83,6 +90,7 @@ NODE_IDENTIFY_CLAUSES = "identify_clauses"
 NODE_EXTRACT_METADATA = "extract_metadata"
 NODE_EXTRACT_KEYWORDS = "extract_keywords"
 NODE_RULE_REVIEW = "rule_review"
+NODE_LLM_REVIEW = "llm_review"
 
 # -------------------------- Conditional Edge -------------------------- #
 #: 分支名 → 真实目标（``END`` 是 langgraph 的结束哨兵，不是普通节点）
@@ -99,6 +107,15 @@ PARSE_ROUTES: dict[str, str] = {
     "stop": END,
 }
 
+#: ``llm_review`` 之后的分支表（P9-6a）。
+#: ⚠️ **两条路目前都通向 ``END``** —— 后续节点（风险合并 / 评分）还没实现。
+#: 分支名先定下来，将来接后续节点时**只改这张表**，不用碰节点内部：
+#: ``continue`` 带模型结论往下走，``fallback`` 只带规则结果。
+LLM_ROUTES: dict[str, str] = {
+    "continue": END,
+    "fallback": END,
+}
+
 
 def build_review_graph() -> CompiledStateGraph:
     """装配并编译最小合同审查 Graph。"""
@@ -112,6 +129,7 @@ def build_review_graph() -> CompiledStateGraph:
     graph.add_node(NODE_EXTRACT_METADATA, extract_metadata)
     graph.add_node(NODE_EXTRACT_KEYWORDS, extract_keywords)
     graph.add_node(NODE_RULE_REVIEW, rule_review)
+    graph.add_node(NODE_LLM_REVIEW, llm_review)
 
     # ---- 主干 ----
     graph.add_edge(START, NODE_UPLOAD_FILE)
@@ -135,20 +153,29 @@ def build_review_graph() -> CompiledStateGraph:
     graph.add_edge(NODE_IDENTIFY_CLAUSES, NODE_EXTRACT_METADATA)
     graph.add_edge(NODE_EXTRACT_METADATA, NODE_EXTRACT_KEYWORDS)
 
-    # ---- 规则审查：确定性规则求值（LLM 审查在 P9 之后接在它后面） ----
+    # ---- 规则审查：确定性规则求值 ----
     graph.add_edge(NODE_EXTRACT_KEYWORDS, NODE_RULE_REVIEW)
 
-    # ---- 收尾 ----
-    graph.add_edge(NODE_RULE_REVIEW, END)
+    # ---- LLM 审查：模型审一遍条款（P9-6a 接入） ----
+    graph.add_edge(NODE_RULE_REVIEW, NODE_LLM_REVIEW)
+
+    # ---- 分支：LLM 有结论 / 降级为"仅规则结果"，两条都继续 ----
+    graph.add_conditional_edges(
+        NODE_LLM_REVIEW,
+        route_after_llm_review,
+        LLM_ROUTES,
+    )
 
     return graph.compile()
 
 
 __all__ = [
     "CONDITIONAL_ROUTES",
+    "LLM_ROUTES",
     "NODE_EXTRACT_KEYWORDS",
     "NODE_EXTRACT_METADATA",
     "NODE_IDENTIFY_CLAUSES",
+    "NODE_LLM_REVIEW",
     "NODE_PARSE_DOCUMENT",
     "NODE_RULE_REVIEW",
     "NODE_UPLOAD_FILE",

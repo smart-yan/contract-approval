@@ -32,7 +32,7 @@ from app.llm.findings import (
 )
 from app.llm.json_guard import LLMSchemaInvalidError
 from app.llm.prompts import PROMPT_CLAUSE_REVIEW_V1
-from app.llm.provider import DeepSeekProvider, LLMUnavailableError
+from app.llm.provider import DeepSeekProvider, LLMProvider, LLMUnavailableError
 from app.llm.schemas import LLMRequest, LLMResult
 
 # --------------------------------------------------------------------------- #
@@ -92,10 +92,14 @@ def _llm_result(raw_text: str, **overrides: Any) -> LLMResult:
 
 
 class FakeProvider:
-    """只实现 ``LLMProvider`` 协议的最小替身：记录请求、返回预设结果或抛预设异常。"""
+    """``LLMProvider`` 协议的最小替身：记录请求、返回预设结果或抛预设异常。
+
+    ``aclose()`` 是协议的一部分（应用级生命周期），替身同样要有。
+    """
 
     def __init__(self, *, raw_text: str = "{}", error: Exception | None = None) -> None:
         self.requests: list[LLMRequest] = []
+        self.closed = False
         self._raw_text = raw_text
         self._error = error
 
@@ -104,6 +108,16 @@ class FakeProvider:
         if self._error is not None:
             raise self._error
         return _llm_result(self._raw_text)
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+# --------------------------------------------------------------------------- #
+# 替身符合协议
+# --------------------------------------------------------------------------- #
+def test_double_satisfies_the_provider_protocol() -> None:
+    assert isinstance(FakeProvider(), LLMProvider)
 
 
 # --------------------------------------------------------------------------- #

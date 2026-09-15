@@ -23,10 +23,31 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app.api.review as review_module
+from app.core.config import get_settings
+from app.llm.schemas import LLMRequest, LLMResult
 from app.main import app
 from app.rules.schemas import EvaluationFailureReason, RuleEvaluationStatus
 from app.tools.backend_client import BackendClient
 from tests.factories import docx_bytes
+
+
+class _FakeProvider:
+    """离线 provider：只记录请求，返回"没发现问题"。
+
+    ⚠️ 必须带 ``aclose()``：lifespan 关闭时会关掉 ``app.state.llm_provider``，
+    替身少了这个方法就会在 **teardown** 阶段炸掉（而不是在断言里）。
+    """
+
+    def __init__(self) -> None:
+        self.requests: list[LLMRequest] = []
+
+    async def complete(self, request: LLMRequest) -> LLMResult:
+        self.requests.append(request)
+        return LLMResult(raw_text='{"findings": []}', model="fake", provider="fake")
+
+    async def aclose(self) -> None:
+        """与 :class:`~app.llm.provider.DeepSeekProvider` 同一份生命周期接口。"""
+
 
 #: 节点模块对象 —— 用于把 ``evaluate_rule`` 换成 spy（见相关用例）。
 #: ⚠️ 不能用字符串 monkeypatch：``nodes/__init__.py`` 重导出了同名函数，
@@ -389,6 +410,51 @@ def test_purchase_request_feeds_metadata_into_the_threshold_rule(
     ]
     assert response.status_code == 200
     assert response.json()["workflow_status"] == "completed"
+
+
+def test_endpoint_injects_the_llm_provider_from_app_state(
+    agent: Callable[[Handler], TestClient],
+) -> None:
+    """P9-6a：编排层把 provider 从 ``app.state`` 注入 ``ReviewContext``，节点用的是它。
+
+    这里把 provider 换成一个离线替身，**证明注入路径真的通了**
+    （换了替身就真的走替身，而不是某个藏在别处的默认实现）。
+    """
+    provider = _FakeProvider()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(201, json=SUCCESS_PAYLOAD)
+
+    test_client = agent(handler)  # 先启动（lifespan 会创建默认 provider）
+    app.state.llm_provider = provider  # 启动后再替换 —— 与 backend_client 同一手法
+    response = _post(test_client)
+
+    assert len(provider.requests) == 1, "llm_review 用的就是注入进来的这个 provider"
+    assert response.status_code == 200
+    assert response.json()["workflow_status"] == "completed"
+
+
+def test_endpoint_degrades_to_rule_only_when_llm_is_unavailable(
+    agent: Callable[[Handler], TestClient],
+) -> None:
+    """LLM 不可用只是**降级**：这次审查照常完成（规则结果仍可用），不是 422。
+
+    覆盖真实默认路径：lifespan 创建的 ``DeepSeekProvider`` 在本机未配置密钥，
+    ``complete()`` 会在本地短路 —— **不会发生任何真实网络调用**。
+    """
+    if get_settings().llm_configured:
+        pytest.skip("本机配置了 DEEPSEEK_*，这条「未配置」用例不适用")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(201, json=SUCCESS_PAYLOAD)
+
+    response = _post(agent(handler))
+
+    body = response.json()
+    assert response.status_code == 200, "LLM 挂了不该让整次审查失败"
+    assert body["workflow_status"] == "completed"
+    assert body["error_code"] is None, "降级不占用整次审查的失败通道"
+    assert body["parse_result"]["status"] == "PARSED"
 
 
 def test_contract_type_without_rule_set_still_completes(

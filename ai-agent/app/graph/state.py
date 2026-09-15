@@ -30,7 +30,8 @@ parse      ``parse_document`` 的产出
 understanding P7 三个能力各自的产出
 rules      ``rule_snapshot`` 是**输入**，``rule_evaluations`` / ``rule_risks`` 是
            ``rule_review`` 的产出
-llm        ``llm_findings`` 是 ``llm_review`` 的产出
+llm        ``llm_findings`` 是 ``llm_review`` 的产出；``llm_error_*`` 是它的
+           **降级**信号（与 ``error_code`` 不是一回事，见字段注释）
 failure    失败信息，同样供 Conditional Edge 读取
 """
 
@@ -102,6 +103,15 @@ class ContractReviewState(TypedDict, total=False):
     #: 与规则侧同理：模型跑失败时这里**保持缺失**，不写空列表
     #: （空列表会被读成"模型看了，没发现问题"）
     llm_findings: list[LLMFinding]
+
+    #: LLM 审查的**降级**信号（P9-6a）。刻意**不**写进 ``error_code``：
+    #: §9.1 第 4 道防线规定"本批降级为**仅规则引擎结果**并在任务上标记 warning，
+    #: 绝不让整个任务失败" —— LLM 失败时规则结果仍然完整可用，
+    #: 若借用 ``error_code``，API 会把一次"规则部分照常可用"的审查报成 rejected。
+    #: 于是它单独占一条通道：**整次审查的失败**（``error_code``）与
+    #: **一次降级**（``llm_error_code``）是两件事，各有各的分流。
+    llm_error_code: str | None
+    llm_error_message: str | None
 
     # ------------------------------ failure ----------------------------- #
     error_code: str | None

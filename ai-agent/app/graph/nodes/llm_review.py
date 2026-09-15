@@ -33,13 +33,20 @@
 "什么时候开始要求 LLM、没配 provider 时整个流程该怎么办"是**接线那一步的裁决**，
 不在本步（本步只建立节点的输入/输出契约）。
 
-失败语义
--------
+失败语义（P9-6a 起：LLM 失败是**降级**，不是整次审查失败）
+------------------------------------------------------
 **不吞异常、也不让它冒泡炸掉整张图**：Provider 与 json_guard 的两类失败
-（``LLM_UNAVAILABLE`` / ``LLM_SCHEMA_INVALID``）在这里被翻译成 State 的
-``error_code`` / ``error_message`` —— 与 ``upload_file`` / ``rule_review``
-同一套失败机制。**降级策略**（例如"LLM 失败就只用规则结果继续跑"）是
-Conditional Edge 与后续步骤的裁决，本节点不替它决定。
+（``LLM_UNAVAILABLE`` / ``LLM_SCHEMA_INVALID``）在这里被翻译成
+``llm_error_code`` / ``llm_error_message`` —— 一条**独立的降级通道**。
+
+为什么不写 ``error_code``：§9.1 第 4 道防线要求"本批降级为**仅规则引擎结果**并标记
+warning，绝不让整个任务失败"。LLM 挂了的时候规则结果仍然完整可用，
+借用整次审查的失败通道会让 API 把这种情形报成 rejected —— 一次"规则部分照常可用"
+的审查被说成失败，既不准确，也会让人以为整个任务白跑了。
+两条通道各有各的分流（见 ``route_after_llm_review``）。
+
+唯一的**致命**失败仍然是输入缺失（``contract_type`` 为空）：那种情况下这个节点
+根本组不出提示，而且 ``upload_file`` 早就该拦住了。
 """
 
 from __future__ import annotations
@@ -72,11 +79,12 @@ async def llm_review(
     """
     provider = runtime.context.llm
     if provider is None:
-        # 没有注入 provider = 这次运行不具备 LLM 审查能力。
-        # 明确记录，而不是拿一个默认 provider 去悄悄发请求。
+        # 没有注入 provider = 这次运行不具备 LLM 审查能力。**这是降级，不是失败**：
+        # 规则结果已经产出且仍然可用，整次审查不该因此被判失败。
+        # 明确记录到降级通道，而不是拿一个默认 provider 去悄悄发请求。
         message = "本次 Graph 运行没有注入 LLM provider（ReviewContext.llm 为空），未执行 LLM 审查"
-        logger.warning("llm_review 缺少依赖 | %s", message)
-        return {"error_code": AgentErrorCode.LLM_UNAVAILABLE.value, "error_message": message}
+        logger.warning("llm_review 降级 | %s", message)
+        return {"llm_error_code": AgentErrorCode.LLM_UNAVAILABLE.value, "llm_error_message": message}
 
     contract_type = state.get("contract_type")
     if not contract_type:
@@ -96,11 +104,11 @@ async def llm_review(
     try:
         outcome = await review_clauses(provider, payload)
     except LLMUnavailableError as exc:
-        logger.warning("llm_review 调用失败（模型不可用）| file_id=%s %s", state.get("file_id"), exc)
-        return {"error_code": exc.error_code, "error_message": str(exc)}
+        logger.warning("llm_review 降级（模型不可用）| file_id=%s %s", state.get("file_id"), exc)
+        return {"llm_error_code": exc.error_code, "llm_error_message": str(exc)}
     except LLMSchemaInvalidError as exc:
-        logger.warning("llm_review 输出不合契约 | file_id=%s %s", state.get("file_id"), exc)
-        return {"error_code": exc.error_code, "error_message": str(exc)}
+        logger.warning("llm_review 降级（输出不合契约）| file_id=%s %s", state.get("file_id"), exc)
+        return {"llm_error_code": exc.error_code, "llm_error_message": str(exc)}
 
     logger.info(
         "llm_review 完成 | file_id=%s clauses=%d findings=%d model=%s tokens=%d/%d latency_ms=%d",

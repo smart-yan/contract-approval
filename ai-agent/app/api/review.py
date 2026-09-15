@@ -50,6 +50,7 @@ from fastapi import APIRouter, File, Form, Request, Response, UploadFile, status
 from app.core.errors import AgentErrorCode
 from app.graph.context import ReviewContext
 from app.graph.state import ContractReviewState, has_usable_document
+from app.llm.provider import LLMProvider
 from app.rules.catalog import RuleSnapshotError, snapshot_from_backend
 from app.rules.schemas import RuleSetSnapshot
 from app.schemas.review import ReviewRunResponse
@@ -162,6 +163,7 @@ async def run_review(
         一律表达成 ``workflow_status="rejected"`` + ``error_code``（HTTP 422）。
     """
     backend: BackendClient = request.app.state.backend_client
+    llm_provider: LLMProvider = request.app.state.llm_provider
     graph = request.app.state.review_graph
 
     # ---- 规则集：编排边界的职责，先拿到再跑图 ----
@@ -199,7 +201,7 @@ async def run_review(
                 # 规则集快照随初始 State 进入图 —— ``rule_review`` 只消费它，不自己去取
                 "rule_snapshot": rule_snapshot,
             },
-            context=ReviewContext(backend=backend),
+            context=ReviewContext(backend=backend, llm=llm_provider),
         )
     finally:
         await asyncio.to_thread(temp_path.unlink, True)
