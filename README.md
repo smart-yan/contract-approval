@@ -32,14 +32,20 @@
 | P11 | 前端工作台（合同列表 + 工作台双栏 + 风险卡片 → 原文滚动高亮） | ✅ PASS |
 | P12 | 报告导出（Markdown 报告 + RFC 5987 中文文件名下载） | ✅ PASS |
 | P13 | 人工复核（复核 PATCH API + 工作台复核 UI + 报告复核标注） | ✅ PASS（`P13-1` ~ `P13-4` 已评审冻结；`P13-5` 收尾中） |
+| P14 | 异步执行（Agent `POST /api/agent/review` 返回 202 + `task_id`，进程内后台图；Agent ↔ Backend 解耦；任务阻塞上报 `POST .../review-tasks/{task_id}/block`） | ✅ PASS / FROZEN |
+| P15 | 审批写回（`POST /api/v1/review-tasks/{task_id}/writeback`；`writeback_record` 状态机 + `idempotency_key` UNIQUE；`approval_comment.idempotency_key` 与 `source` 列扩展；`ApprovalClient` 防腐层 + `MockApprovalClient`；`scripts/seed_mock_approval.py` 4 张审批单；39 个写回集成测试） | ✅ PASS / FROZEN |
+| P16-1 | 异常 / 错误 / 重试 / 集成 Demo 现状侦察（只读审计：49 个 `ErrorCode` 矩阵、Retry 矩阵、P14→P15 集成链路、6 个 Demo 场景、测试隔离、Mock Approval 复现性） | ✅ COMPLETE |
+| P16-2 | Frontend Workbench 审批回写入口（`frontend/src/api/writeback.ts` + `WorkbenchView.vue`「回写审批意见」操作；SUCCESS / FAILED / 409 `WRITEBACK_ALREADY_SUCCESS` 三态；17 个 frontend writeback 测试） | ✅ PASS / FROZEN |
+| P16-3 | 异常路径演示工具与文档（`backend/scripts/demo_writeback_failures.py` 6 个场景 + `docs/16-异常路径演示.md` 索引；**0** 产品代码修改） | ✅ PASS / FROZEN |
+| P16-4 | 文档一致性同步（`README.md` + `docs/01-架构设计.md` 与真实代码 / 测试对齐） | ⏳ 当前实施中 |
 
-> **当前状态**：P4 ~ P12 已提交（Git HEAD = `65a59a7`）。
-> **P13 的成果尚未提交** —— 将在 P13 整体收尾后一次性提交。
+> **当前状态**：P4 ~ P15 阶段性冻结（`backend/tests/integration/` / `backend/app/api/v1/endpoints/` / `backend/app/services/` / `ai-agent/app/api/review.py` / `frontend/src/views/workbench/WorkbenchView.vue` 与对应测试均已 PASS）；P16-1 / P16-2 / P16-3 已完成；P16-4 当前正在做文档同步收尾。
 >
-> 尚未实现的业务：OCR（扫描件）、修改建议生成（`risk_suggestion`）、任务 Worker 与状态机、
-> 审批回写、异常演练与联调、前端文档预览。
+> **本批（P16 全部）尚未做一次整体 commit / push** —— 按协作协议保留所有阶段性修改在工作区，等 P16 整体验收后再一次性 commit。
 >
-> 全部测试基线（P13-5 时点）：Backend **782 passed**、Agent **1021 passed**、Frontend **127 passed**。
+> 尚未实现的业务：OCR（扫描件）、修改建议生成（`risk_suggestion`）、前端文档预览。这些均**不在 P16 范围**。
+>
+> 全部测试基线（P16 收尾时点）：Backend **unit 558 + integration 344 = 902 passed**，Agent **unit 906 + Golden Path 15 = 921 passed**，Frontend **181 passed**。
 
 ### 已知技术债（已接受，不在当时阶段内修复）
 
@@ -71,6 +77,8 @@ MySQL 8.4.8，库 `contract_approval`，字符集 `utf8mb4_0900_ai_ci`。ORM 为
 | 同步游标 | `sync_cursor` |
 
 **刻意未创建**（架构文档中无字段定义，留待对应阶段）：`sys_user`(P4)、`task_event`(P6)、`annotation`(P11)、`report`(P12)、`standard_clause`(P13)、`writeback_log`(P12)。
+
+> ⚠️ `writeback_log` 在 P15 阶段正式被 `writeback_record` 替代：架构裁决明确"一份任务一份写回记录，不引入历史表"（`backend/app/services/writeback.py` 与 `backend/app/db/models/writeback.py` 的 docstring 同步说明）。若同一任务需要多条写回记录，由 `idempotency_key` 区分（同内容同 key → 复用；内容变化 → 新 key → 新行）。
 
 **迁移**：baseline migration `313b0960b510`，位于 `backend/migrations/versions/`。以下命令均已实测通过（`upgrade` 建表 / `check` 与模型逐列一致 / `downgrade` 可逆）：
 

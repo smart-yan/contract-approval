@@ -36,6 +36,14 @@ EXPECTED_INDEXES: dict[str, tuple[str, str]] = {
     "ix_contract_created_at_id": ("contract", "created_at,id"),
 }
 
+#: 本模块要验证的那次迁移**前**的版本（``b0c4aef3060b`` 的 down_revision）。
+#:
+#: ⚠️ 刻意写死而不是用 ``downgrade -1``：``-1`` 是"相对当前 head"的一步，
+#: 而 head 会随着后续迁移前移（P15-3a 就新增了一个 head）。那时 ``-1`` 降的是
+#: **别的**迁移，本模块的断言会以一种极难看懂的方式失败。钉住版本号之后，
+#: "把库降到索引迁移之前"这个意图与 head 在哪里无关。
+BASELINE_REVISION = "313b0960b510"
+
 #: 会被本次迁移**接管**的外键索引（升级后它们应当消失，回滚后应当回来）
 FK_INDEXES = {
     "clause": "fk_clause_task_id_review_task",
@@ -194,12 +202,12 @@ def test_downgrade_removes_the_indexes_and_restores_the_foreign_key_indexes() ->
     （1553：needed in a foreign key constraint），而且会在删掉前几个之后才失败，
     把库留在半吊子状态。
     """
-    _alembic("downgrade", "-1")
+    _alembic("downgrade", BASELINE_REVISION)
 
     indexes = _indexes()
     still_there = [name for name, (table, _) in EXPECTED_INDEXES.items() if (table, name) in indexes]
     assert still_there == [], "5 个索引应当全部消失"
-    assert _scalar("SELECT version_num FROM alembic_version") == "313b0960b510"
+    assert _scalar("SELECT version_num FROM alembic_version") == BASELINE_REVISION
 
     for table, fk_index in FK_INDEXES.items():
         assert (table, fk_index) in indexes, f"{table} 的外键索引 {fk_index} 没有还回来"
@@ -226,14 +234,14 @@ def test_upgrade_lands_in_the_same_state_after_a_round_trip() -> None:
     """
     before = _indexes()
 
-    _alembic("downgrade", "-1")
+    _alembic("downgrade", BASELINE_REVISION)
     _alembic("upgrade", "head")
 
     assert _indexes() == before, "往返之后的索引集合与干净升级不一致"
 
 
 def test_a_round_trip_leaves_no_redundant_foreign_key_index() -> None:
-    _alembic("downgrade", "-1")
+    _alembic("downgrade", BASELINE_REVISION)
     _alembic("upgrade", "head")
 
     indexes = _indexes()

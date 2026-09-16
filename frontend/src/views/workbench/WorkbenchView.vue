@@ -30,6 +30,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { ApiError } from '@/api/request'
 import { reviewRiskItem, type RiskReviewRequest, type RiskReviewResult } from '@/api/risk-review'
 import { getReviewTaskWorkbench, type WorkbenchResponse, type WorkbenchRisk } from '@/api/workbench'
+import { postWriteback, type WritebackResult } from '@/api/writeback'
 import { useReviewPolling } from '@/composables/useReviewPolling'
 import {
   RISK_REVIEW_DECISIONS,
@@ -452,6 +453,125 @@ function backToContracts(): void {
   void router.push('/contracts')
 }
 
+// --------------------------------------------------------------------------- //
+// 审批回写（P16-2）—— 操作状态 / 错误展示，不改 API 返回的对象
+// --------------------------------------------------------------------------- //
+//
+/**
+ * 写回按钮是否在跑：用于按钮 ``loading`` + 防并发点击。
+ *
+ * ⚠️ 写回请求本身**可能耗时**（要调外部审批系统），UI 不能让用户重复点；
+ * ``loading=true`` 时按钮 disable，由 try/finally 保证必然回落。
+ */
+const writebackLoading = ref(false)
+
+/**
+ * 写回结果快照（成功 / 失败）。``null`` = 还没回写过。
+ *
+ * ⚠️ **保留跨刷新**：写回结果在任务级别是有意义的事实，不能因为 workbench
+ * 重新加载（轮询、点刷新）就清掉 —— 那等于"成功写过、但刷新之后按钮又出现"，
+ * 用户会以为刚才那次没生效。所以这里**不**与 ``workbench.value`` 绑定，
+ * ``onData`` 不重置它，只在重新发起写回时按状态机更新。
+ */
+const writebackResult = ref<WritebackResult | null>(null)
+
+/**
+ * 写回操作本身抛出的业务错误（4xx / 网络）。与 :data:`writebackResult.error_msg`
+ * 是两件事：
+ *
+ * * ``writebackResult.error_msg`` ← Backend 在 ``status=failed`` 时给的人话原因
+ * * ``writebackError`` ← 前端把 4xx / 网络错误转成一句业务提示
+ *
+ * 409 ``WRITEBACK_ALREADY_SUCCESS`` **不进这里**：那是"已经成功过"的事实，会
+ * 直接把 :data:`writebackResult` 标成 success（见 :func:`submitWriteback`）。
+ */
+const writebackError = ref('')
+
+/**
+ * 写回操作的错误翻译（仿 :func:`reviewErrorMessage` 的写法）。
+ *
+ * ⚠️ **422 单独判 ``status`` 而不是 ``code``**：与 P13-3 同一条理由 —— FastAPI
+ * 默认 422 校验响应里没有 ``code``，拦截器会归成 ``NETWORK_ERROR``。
+ */
+function writebackErrorMessage(error: unknown): string {
+  if (!(error instanceof ApiError)) {
+    return '回写失败，请稍后重试'
+  }
+  switch (error.code) {
+    case 'WRITEBACK_NOT_READY':
+      return '该任务尚未审查完成，无法回写'
+    case 'WRITEBACK_APPROVAL_NOT_READY':
+      return '该合同尚未关联审批单，无法回写审批意见'
+    case 'TASK_NOT_FOUND':
+      return '审查任务不存在'
+    case 'CONTRACT_NOT_FOUND':
+      return '审查任务关联的合同不存在'
+    case 'NOT_FOUND':
+      return '合同关联的审批单行不存在'
+    default:
+      break
+  }
+  if (error.status === 422) {
+    return '请求参数不合法'
+  }
+  return error.message
+}
+
+/**
+ * 提交一次写回（首次 / 重试都走这里）。
+ *
+ * 重要语义
+ * --------
+ * * **不接 ``approval_instance_id``** —— Backend 沿合同侧解析（§15）。
+ * * **不接 ``idempotency_key``** —— Backend 的 renderer 按
+ *   ``task_id + content_md_hash`` 生成；同内容第二次提交会被原样复用，不产生
+ *   第二条评论（§6.2 冻结）。
+ * * **409 ``WRITEBACK_ALREADY_SUCCESS`` 不当作错误**：那是"已经成功过"的
+ *   事实，把 :data:`writebackResult` 标成 success，UI 进入"已写回"态，
+ *   与正常成功路径**视觉上一致**。
+ * * **不要重发**：见 ``writeback_result.status === 'success'`` 的按钮 disabled
+ *   逻辑（模板）。
+ *
+ * ⚠️ **只在 ``phase === 'reviewed'`` 时调用**：调用方（按钮）负责门禁，这里
+ * 不再二次校验 —— 二次校验要么写在按钮的 ``disabled``、要么写在这里一份，结果
+ * 是同一件事多写一遍。
+ */
+async function submitWriteback(): Promise<void> {
+  const id = taskId.value
+  if (id === null || writebackLoading.value) {
+    return
+  }
+
+  writebackLoading.value = true
+  writebackError.value = ''
+
+  try {
+    const result = await postWriteback(id)
+    writebackResult.value = result
+  } catch (error) {
+    if (error instanceof ApiError && error.code === 'WRITEBACK_ALREADY_SUCCESS') {
+      // 409 表达的语义是"已经成功了" —— 与正常成功路径一致处理：
+      // 1. 把结果标成 success（attempt 至少为 1，但前端拿不到历史记录，用 attempt=1 占位）
+      // 2. **不**当作错误展示
+      writebackResult.value = writebackResult.value ?? {
+        record_id: 0,
+        task_id: id,
+        approval_instance_id: 0,
+        status: 'success',
+        attempt: 1,
+        external_comment_id: null,
+        error_msg: null,
+        finished_at: null,
+        posted: false,
+      }
+      return
+    }
+    writebackError.value = writebackErrorMessage(error)
+  } finally {
+    writebackLoading.value = false
+  }
+}
+
 onMounted(load)
 </script>
 
@@ -765,6 +885,100 @@ onMounted(load)
           </div>
         </el-card>
 
+        <!-- ---------------- 审批回写（P16-2 / P15-3b） ---------------- -->
+        <!--
+          ⚠️ **只**在 ``phase === 'reviewed'`` 时渲染这张卡片：写回门禁是
+          ``current_stage == REVIEWED``（Backend §15-2 冻结）。processing / blocked
+          时连卡片都不显示，用户就不会误以为可以写回。
+
+          这张卡片与下面"合同原文"是平级关系，不属于某个风险卡片 —— 它表达的是
+          "对这份审查整体"的操作。
+        -->
+        <el-card v-if="phase === 'reviewed'" class="workbench__section" shadow="never">
+          <template #header><span>审批回写</span></template>
+
+          <!--
+            三种结果形态互斥：success / failed / 未写过。互斥由 v-if / v-else-if 链
+            保证 —— 不会出现"同时显示成功和失败"的诡异组合。
+          -->
+          <div v-if="writebackResult?.status === 'success'" class="workbench__writeback">
+            <el-alert
+              type="success"
+              :closable="false"
+              show-icon
+              :title="writebackResult.posted
+                ? '审查意见已成功回写到审批单'
+                : '回写已完成（外部审批系统已有该意见，本次未重复发送）'"
+            />
+            <dl class="workbench__writeback-fields">
+              <template v-if="writebackResult.external_comment_id">
+                <dt>外部评论 ID</dt>
+                <dd><code>{{ writebackResult.external_comment_id }}</code></dd>
+              </template>
+              <dt>尝试次数</dt>
+              <dd>第 {{ writebackResult.attempt }} 次</dd>
+              <dt>完成时刻</dt>
+              <dd>{{ writebackResult.finished_at ? formatUtcTimestamp(writebackResult.finished_at) : '—' }}</dd>
+            </dl>
+            <!--
+              SUCCESS 后按钮保持可见但 **disabled** —— 不消失，让用户能看出"这就是写
+              回操作的最终态"；再次点击也不会重发（Backend 自身也用 409 挡）。
+            -->
+            <div class="workbench__actions">
+              <el-button :disabled="true">已成功回写</el-button>
+            </div>
+          </div>
+
+          <div v-else-if="writebackResult?.status === 'failed'" class="workbench__writeback">
+            <el-alert
+              type="error"
+              :closable="false"
+              show-icon
+              title="回写失败"
+              :description="writebackResult.error_msg ?? '审批系统写入失败'"
+            />
+            <dl class="workbench__writeback-fields">
+              <dt>已尝试</dt>
+              <dd>{{ writebackResult.attempt }} 次</dd>
+              <dt>完成时刻</dt>
+              <dd>{{ writebackResult.finished_at ? formatUtcTimestamp(writebackResult.finished_at) : '—' }}</dd>
+            </dl>
+            <!--
+              失败可以重试：FAILED → WRITING 在状态机里允许（Backend §6.2）。
+              不重置 ``writebackResult``，而是**覆盖**它（见 ``submitWriteback``）。
+            -->
+            <div class="workbench__actions">
+              <el-button type="primary" :loading="writebackLoading" @click="submitWriteback">
+                重试写回
+              </el-button>
+            </div>
+          </div>
+
+          <div v-else class="workbench__writeback">
+            <p class="workbench__writeback-hint">
+              将本任务的审查意见发送到该合同关联的审批单评论区。同内容重复提交不会产生第二条评论。
+            </p>
+            <div class="workbench__actions">
+              <el-button type="primary" :loading="writebackLoading" @click="submitWriteback">
+                回写审批意见
+              </el-button>
+            </div>
+          </div>
+
+          <!--
+            业务错误（4xx / 网络）展示在卡片最下方 —— 与 success/failed 卡片互不重叠。
+            success / failed 时不显示这个 alert。
+          -->
+          <el-alert
+            v-if="writebackError"
+            class="workbench__writeback-error"
+            type="error"
+            :closable="false"
+            show-icon
+            :title="writebackError"
+          />
+        </el-card>
+
         <!-- ---------------- 原文 ---------------- -->
         <el-card class="workbench__section" shadow="never">
           <template #header><span>合同原文（{{ workbench.blocks.length }} 段）</span></template>
@@ -900,6 +1114,47 @@ onMounted(load)
 }
 
 .review__error {
+  margin-top: 8px;
+}
+
+/* ---------------- 审批回写（P16-2）---------------- */
+.workbench__writeback {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.workbench__writeback-hint {
+  margin: 0;
+  color: var(--el-text-color-regular);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.workbench__writeback-fields {
+  display: grid;
+  grid-template-columns: 96px 1fr;
+  gap: 4px 12px;
+  margin: 0;
+  font-size: 13px;
+}
+
+.workbench__writeback-fields dt {
+  color: var(--el-text-color-secondary);
+}
+
+.workbench__writeback-fields dd {
+  margin: 0;
+}
+
+.workbench__writeback-fields code {
+  font-family: monospace;
+  background-color: var(--el-fill-color-light);
+  padding: 0 4px;
+  border-radius: 3px;
+}
+
+.workbench__writeback-error {
   margin-top: 8px;
 }
 

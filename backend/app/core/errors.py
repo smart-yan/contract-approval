@@ -143,6 +143,11 @@ class ErrorCode(StrEnum):
     # ------------------------ 回写与审批 ------------------------ #
     WRITEBACK_FAILED = "WRITEBACK_FAILED"  # §8 明确点名的错误码
     WRITEBACK_NOT_READY = "WRITEBACK_NOT_READY"
+    #: 任务审完了，但**这份合同还没关联审批单**（``contract.approval_instance_id`` 为 NULL），
+    #: 因此不知道意见该写到哪个审批单上去（P15-3b）。
+    #: ⚠️ 与 ``WRITEBACK_NOT_READY`` 分开：那个说"审查还没跑完"，这个说"审查完了但没地方写"。
+    #: 两者的处置也不同 —— 前者等，后者要人去把合同与审批单关联起来。
+    WRITEBACK_APPROVAL_NOT_READY = "WRITEBACK_APPROVAL_NOT_READY"
     WRITEBACK_ALREADY_SUCCESS = "WRITEBACK_ALREADY_SUCCESS"  # 幂等键已成功，拒绝重复写
     APPROVAL_SYSTEM_UNAVAILABLE = "APPROVAL_SYSTEM_UNAVAILABLE"
 
@@ -238,6 +243,9 @@ ERROR_SPECS: dict[ErrorCode, ErrorSpec] = {
     # ------------------------ 回写与审批 ------------------------ #
     ErrorCode.WRITEBACK_FAILED: ErrorSpec(502, ErrorCategory.SYSTEM_ERROR, "审批意见回写失败"),
     ErrorCode.WRITEBACK_NOT_READY: ErrorSpec(409, ErrorCategory.USER_ERROR, "任务尚未审查完成，无法回写"),
+    ErrorCode.WRITEBACK_APPROVAL_NOT_READY: ErrorSpec(
+        409, ErrorCategory.USER_ERROR, "该合同尚未关联审批单，无法回写审批意见"
+    ),
     ErrorCode.WRITEBACK_ALREADY_SUCCESS: ErrorSpec(
         409, ErrorCategory.USER_ERROR, "该意见已成功回写，无需重复提交"
     ),

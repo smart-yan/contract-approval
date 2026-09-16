@@ -11,14 +11,24 @@ P10-1 批准了文档层写入（``POST /api/v1/review-tasks/{task_id}/document`
 P11-3/4 批准了合同列表与工作台查询（``GET /api/v1/contracts``、
 ``GET /api/v1/review-tasks/{task_id}/workbench``），
 P12-3 批准了报告导出（``GET /api/v1/review-tasks/{task_id}/report/export``），
-P14-4 批准了任务阻塞写入（``POST /api/v1/review-tasks/{task_id}/block``）。
+P14-4 批准了任务阻塞写入（``POST /api/v1/review-tasks/{task_id}/block``），
+P15-3b 批准了审批意见回写（``POST /api/v1/review-tasks/{task_id}/writeback``）。
 """
 
 from __future__ import annotations
 
 from fastapi import APIRouter
 
-from app.api.v1.endpoints import contracts, documents, reports, risks, rule_sets, tasks, workbench
+from app.api.v1.endpoints import (
+    contracts,
+    documents,
+    reports,
+    risks,
+    rule_sets,
+    tasks,
+    workbench,
+    writeback,
+)
 
 api_v1_router = APIRouter()
 api_v1_router.include_router(contracts.router)
@@ -28,5 +38,6 @@ api_v1_router.include_router(documents.router)
 api_v1_router.include_router(workbench.router)
 api_v1_router.include_router(reports.router)
 api_v1_router.include_router(tasks.router)
+api_v1_router.include_router(writeback.router)
 
 __all__ = ["api_v1_router"]

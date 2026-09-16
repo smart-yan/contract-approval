@@ -112,6 +112,7 @@ def test_only_approved_business_routes_are_mounted(app: FastAPI) -> None:
         "/api/v1/review-tasks/{task_id}/report/export",
         "/api/v1/review-tasks/{task_id}/risks/{risk_id}",
         "/api/v1/review-tasks/{task_id}/block",
+        "/api/v1/review-tasks/{task_id}/writeback",
     }
 
     paths = set(app.openapi()["paths"])

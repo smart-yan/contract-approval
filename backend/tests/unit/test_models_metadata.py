@@ -195,6 +195,24 @@ def test_key_unique_columns_are_unique_and_not_null(table_name: str, column_name
     assert col.nullable is False
 
 
+def test_approval_comment_idempotency_key_is_scoped_to_the_instance() -> None:
+    """P15-3a：幂等键是"**外部请求**的身份"，只在**审批单内**唯一。
+
+    ⚠️ 列**可空**是刻意的：人工评论（``source=MANUAL``）没有外部请求身份，
+    硬要它编一个键就是伪造。MySQL 的唯一索引不把多个 NULL 视为冲突，
+    因此可空列在本约束下仍允许任意多条人工评论。
+    """
+    table = Base.metadata.tables["approval_comment"]
+    composites = {
+        frozenset(c.name for c in uc.columns) for uc in table.constraints if isinstance(uc, UniqueConstraint)
+    }
+    assert frozenset({"instance_id", "idempotency_key"}) in composites
+
+    column = table.columns["idempotency_key"]
+    assert column.nullable is True, "人工评论没有幂等键，列必须可空"
+    assert column.unique is None, "幂等键不是全局唯一 —— 两个审批单可以各自收到同一个键"
+
+
 def test_review_rule_has_composite_unique_within_set() -> None:
     """§7.2「rule_code UNIQUE within set」→ 复合唯一，而非全局唯一。"""
     table = Base.metadata.tables["review_rule"]
