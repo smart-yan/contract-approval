@@ -34,6 +34,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app.api.review as review_module
+from app.background import BackgroundReviews
 from app.core.config import get_settings
 from app.llm.schemas import LLMRequest, LLMResult
 from app.main import app
@@ -885,3 +886,88 @@ def test_a_pre_upload_without_a_task_id_is_refused(
     assert body["workflow_status"] == "rejected"
     assert body["error_code"] == "BACKEND_CONTRACT_INCOMPLETE"
     assert app.state.background_reviews.active_count == 0, "没拿到 task_id 就不该启动后台图"
+
+
+# --------------------------------------------------------------------------- #
+# P14-4 follow-up：shutdown 取消的**两种**形态，收尾方式必须各管各的
+# --------------------------------------------------------------------------- #
+def _temp_uploads() -> set[Path]:
+    """系统临时目录里 Agent 的落盘文件。断言用**文件系统的事实**，不看日志。"""
+    return set(Path(tempfile.gettempdir()).glob("agent-upload-*"))
+
+
+def _saturate(
+    test_client: TestClient, gate: asyncio.Event
+) -> BackgroundReviews:
+    """把登记处换成"只容得下 1 个、0.05s 就放弃"的实例，并让图卡在闸门上。
+
+    这样第二个 POST 必然**排队**，而 drain 必然超时取消 —— 两种被取消的形态
+    因此可以被确定性地制造出来，不依赖真实的时长。
+
+    ⚠️ 只换 ``app.state`` 上的两个对象（与 provider / backend_client 同一手法），
+    **不改任何节点、不改端点**。
+    """
+    registry = BackgroundReviews(concurrency=1, drain_timeout_seconds=0.05)
+    app.state.background_reviews = registry
+    app.state.review_graph = _FakeGraph(gate=gate)
+    return registry
+
+
+def test_a_queued_review_that_is_abandoned_leaves_no_upload_behind(
+    agent: Callable[[Handler], TestClient],
+) -> None:
+    """**闸门外**那一半：shutdown 时还在排队的审查被放弃，临时文件也必须被删掉。
+
+    ⚠️ 这种任务连图都没开始跑，``_execute_review`` 的 ``finally`` **不会执行**
+    （协程一次都没被 ``await`` 过）。删文件的责任因此落在 ``on_abandon`` 上 ——
+    漏了它，临时目录里就会留下一份合同副本。
+    """
+    backend = _Backend()
+    gate = asyncio.Event()
+    test_client = agent(backend.handler)
+    registry = _saturate(test_client, gate)
+
+    before = _temp_uploads()
+
+    first = _post(test_client, settle=False)  # 占住唯一的名额（图卡在 gate 上不放）
+    test_client.portal.call(asyncio.sleep, 0.05)
+    second = _post(test_client, settle=False)  # 只能排队
+
+    assert first.status_code == second.status_code == 202
+    assert registry.active_count == 2
+    assert len(_temp_uploads() - before) == 2, "两次请求各自落了一份临时文件"
+
+    test_client.portal.call(registry.drain)
+
+    assert _temp_uploads() - before == set(), "被放弃的排队任务同样必须删掉自己的临时文件"
+    assert registry.active_count == 0
+
+
+def test_a_cancelled_running_review_reports_blocked_then_propagates(
+    agent: Callable[[Handler], TestClient],
+) -> None:
+    """**闸门内**那一半：正在跑的审查被取消 → 如实上报 BLOCKED → 取消继续传播。
+
+    与上一条对照着看：同样是 shutdown 取消，跑起来的那一半由
+    ``_execute_review`` 自己的 ``except CancelledError`` 兜住（它要调 Backend，
+    所以只能由它做），排队的那一半由 ``on_abandon`` 兜住。两条路**互斥**。
+
+    ⚠️ "取消继续传播"这件事只能这样观察：任务最终处于 ``cancelled``，
+    而不是被当成正常结束 —— 吞掉取消会让 asyncio 与登记处都看不出它没跑完。
+    """
+    backend = _Backend()
+    gate = asyncio.Event()
+    test_client = agent(backend.handler)
+    registry = _saturate(test_client, gate)
+
+    _post(test_client, settle=False)
+    test_client.portal.call(asyncio.sleep, 0.05)
+    task = next(iter(registry._tasks))
+
+    test_client.portal.call(registry.drain)
+
+    assert backend.block_payloads, "被取消的图必须留下阻塞痕迹（请求早已 202，没人能再返回错误）"
+    payload = backend.block_payloads[0]
+    assert payload["block_reason_code"] == "AGENT_GRAPH_EXECUTION_FAILED"
+    assert "中断" in payload["block_reason_msg"]
+    assert task.cancelled(), "上报之后必须让取消继续传播，不能吞掉"

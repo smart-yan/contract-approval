@@ -8,11 +8,14 @@ P14-4 把图的执行搬到了 HTTP 请求之外，于是"谁在跑、跑完没�
 * 异常**不被静默吞掉**
 * 并发闸门真的挡得住
 * ``drain`` 会等，等不到会取消
+* **排队时就被取消**的任务：协程体从没跑过，它的 ``finally`` 也不会跑 ——
+  资源由 ``on_abandon`` 兜住，且不留下 "never awaited" 噪声
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 
 import pytest
@@ -240,3 +243,76 @@ async def test_drain_does_not_raise_when_a_task_failed() -> None:
 
     assert task.done()
     assert registry.active_count == 0
+
+
+# --------------------------------------------------------------------------- #
+# 5：排队中被放弃 —— 协程体没跑过，收尾只能由 on_abandon 兜
+# --------------------------------------------------------------------------- #
+async def test_a_queued_task_gives_its_resources_back_when_abandoned() -> None:
+    """**闸门外的取消是另一条路径**：``coro`` 一次都没被 ``await`` 过。
+
+    它的 ``try/finally`` 因此完全没有机会执行 —— 这正是 ``on_abandon`` 存在的理由。
+    这里用一个"释放资源"的替身，确认它**确实被调了**；真实资源（临时上传文件）
+    由端点级用例覆盖。
+    """
+    registry = BackgroundReviews(concurrency=1, drain_timeout_seconds=0.05)
+    gate = asyncio.Event()
+    released: list[str] = []
+
+    async def release() -> None:
+        released.append("on_abandon")
+
+    async def holder() -> None:
+        await gate.wait()
+
+    async def queued() -> None:
+        released.append("协程体")  # 不该出现：它排在闸门外，没轮到就被取消了
+        await asyncio.sleep(10)
+
+    registry.start(holder(), name="review:holder")
+    await asyncio.sleep(0)  # 让占位任务真的占住唯一的名额
+
+    registry.start(queued(), name="review:queued", on_abandon=release)
+    await asyncio.sleep(0)
+    assert registry.active_count == 2, "排队中的任务同样在登记处里"
+
+    await registry.drain()
+
+    assert released == ["on_abandon"], "协程体没跑，收尾只能由 on_abandon 完成"
+    assert registry.active_count == 0
+
+
+async def test_an_abandoned_coroutine_is_closed_not_left_unawaited() -> None:
+    """被放弃的协程必须**显式关闭**。
+
+    没被 ``await`` 过的协程对象被回收时，Python 会报 "coroutine ... was never
+    awaited"。那条警告在这条路径上**是误报**：真正发生的是"这次审查没开始"，
+    不是"有人写漏了 await" —— 它出现在日志里只会把排查引到错的方向。
+
+    ⚠️ 这里断言的是**协程对象自身的状态**，不是"警告有没有出现"：警告在回收时
+    才发出，测试里靠抓警告来断言是不稳定的（实测过：不 ``close()`` 时警告会溜到
+    测试的警告汇总里，而断言照样通过）。状态是确定的 —— ``close()`` 过就是
+    ``CORO_CLOSED``，没被碰过就是 ``CORO_CREATED``。
+    """
+
+    async def queued() -> None:
+        await asyncio.sleep(10)  # pragma: no cover - 永远不会执行到这里
+
+    registry = BackgroundReviews(concurrency=1, drain_timeout_seconds=0.05)
+
+    async def holder() -> None:
+        await asyncio.Event().wait()
+
+    registry.start(holder(), name="review:holder")
+    await asyncio.sleep(0)
+
+    coro = queued()
+    assert inspect.getcoroutinestate(coro) == "CORO_CREATED", "还没人 await 过它"
+
+    registry.start(coro, name="review:queued")
+    await asyncio.sleep(0)
+    await registry.drain()
+
+    assert inspect.getcoroutinestate(coro) == "CORO_CLOSED", (
+        "放弃时必须 close()，否则回收时会报一条误导性的 never awaited"
+    )

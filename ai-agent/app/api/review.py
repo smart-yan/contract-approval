@@ -101,6 +101,18 @@ async def _spool_to_temp(upload: UploadFile, suffix: str) -> Path:
     return path
 
 
+async def _discard_temp_file(path: Path) -> None:
+    """删掉落盘的临时上传文件（幂等：文件已经不在了也算成功）。
+
+    临时文件的删除有两个触发点，**互斥**且都走这里：
+
+    * 协程**跑起来了** → :func:`_execute_review` 的 ``finally``
+    * 协程**还在排队就被放弃** → :meth:`BackgroundReviews.start` 的 ``on_abandon``
+      （那时 ``finally`` 根本没机会执行）
+    """
+    await asyncio.to_thread(path.unlink, True)
+
+
 def _rejected_before_start(response: Response, error_code: str, message: str) -> ReviewRunResponse:
     """**启动阶段**就失败时的响应 —— 图没有启动，任务可能根本还没建出来。
 
@@ -301,7 +313,7 @@ async def _execute_review(
         )
         return
     finally:
-        await asyncio.to_thread(temp_path.unlink, True)
+        await _discard_temp_file(temp_path)
 
     body = _to_response(final_state)
     if body.workflow_status == "completed":
@@ -445,7 +457,11 @@ async def run_review(
         )
 
     # ---- ④ 登记后台任务，立刻返回 ----
-    # ⚠️ 临时文件交给后台协程删 —— 请求返回时图还没跑完
+    # ⚠️ 临时文件交给后台删 —— 请求返回时图还没跑完。
+    # 两条互斥的路径覆盖它的全部结局：**跑起来了**由协程自己的 ``finally`` 删；
+    # **还在排队就被取消**（shutdown）时协程一次都没被 await 过，``finally``
+    # 不会执行，因此这里额外登记 ``on_abandon`` 兜住那一半 —— 否则临时目录里
+    # 会留下一份合同副本。见 ``app/background.py`` 的说明。
     background.start(
         _execute_review(
             graph=graph,
@@ -461,6 +477,7 @@ async def run_review(
             rule_snapshot=rule_snapshot,
         ),
         name=f"review:{task_id}",
+        on_abandon=lambda: _discard_temp_file(temp_path),
     )
 
     response.status_code = status.HTTP_202_ACCEPTED
