@@ -17,6 +17,9 @@ const SAMPLE: WorkbenchResponse = {
     finished_at: null,
     risk_level_final: null,
     conclusion: null,
+    // P14-5-2：阻塞原因。**没被阻塞的任务两个都是 null**（键存在，值为空）
+    block_reason_code: null,
+    block_reason_msg: null,
   },
   contract: {
     contract_id: 1,

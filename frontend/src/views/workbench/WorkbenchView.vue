@@ -18,6 +18,11 @@
  * ``highlighted`` / ``active`` / ``review_status`` 之类的状态）。选中状态、复核草稿、
  * 保存结果**一律另开 ref 维护**，模板按"本地覆盖优先"读取。
  * 那份响应是一次快照，被就地改写后就再也说不清"原始数据是什么样"。
+ *
+ * 审查中轮询（P14-5-1）：上传后跳进来时任务可能还在后台跑（P14-4 起受理即返回 202），
+ * 因此本页在任务未到终态时**反复取同一份数据**，直到 ``current_stage === 'REVIEWED'``
+ * 或被 ``status === 'blocked'`` 拦下。判据只有这两条，全部来自 Backend
+ * （见 ``constants/review.ts`` 的 ``reviewPhase``）；页面**不自己算进度、不自己超时**。
  */
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -25,7 +30,14 @@ import { useRoute, useRouter } from 'vue-router'
 import { ApiError } from '@/api/request'
 import { reviewRiskItem, type RiskReviewRequest, type RiskReviewResult } from '@/api/risk-review'
 import { getReviewTaskWorkbench, type WorkbenchResponse, type WorkbenchRisk } from '@/api/workbench'
-import { RISK_REVIEW_DECISIONS, riskReviewStatusLabel, taskStageLabel } from '@/constants/review'
+import { useReviewPolling } from '@/composables/useReviewPolling'
+import {
+  RISK_REVIEW_DECISIONS,
+  riskReviewStatusLabel,
+  reviewPhase,
+  taskStageLabel,
+  type ReviewPhase,
+} from '@/constants/review'
 import { formatUtcTimestamp } from '@/utils/datetime'
 
 const route = useRoute()
@@ -340,10 +352,89 @@ function handleRiskLocate(risk: WorkbenchRisk): void {
   target.scrollIntoView({ behavior: 'smooth', block: 'center' })
 }
 
-async function load(): Promise<void> {
-  loading.value = true
+/**
+ * 取一次工作台数据。
+ *
+ * ⚠️ ``taskId`` 为 null 时**抛一个 TASK_NOT_FOUND**，而不是返回空数据：调用方
+ * （下面的轮询）只有"拿到数据"与"出错"两条路，"参数不合法"属于后者，交给既有的
+ * 错误分支显示成"任务不存在"即可 —— 与 P11 的原有处理一致。
+ */
+async function fetchWorkbench(): Promise<WorkbenchResponse> {
+  const id = taskId.value
+  if (id === null) {
+    // 只有 taskId 合法才会启动轮询，这里正常到不了
+    throw new ApiError({ code: 'TASK_NOT_FOUND', message: '任务 ID 不合法' })
+  }
+  return await getReviewTaskWorkbench(id)
+}
+
+/**
+ * 轮询（P14-5-1）：任务没到终态就继续问 Backend，到了就停。
+ *
+ * 停的三种情况（见 ``composables/useReviewPolling``）：终态 / 取数失败 / 组件卸载。
+ *
+ * ⚠️ 每次轮询都会重建复核草稿（``seedReviewDrafts``）—— 这是**安全的**，因为
+ * 轮询只在任务还没审完时进行，那时 ``risks`` 必然为空、用户也无从填写草稿；
+ * 一旦转到 ``REVIEWED``，这一轮就是最后一轮，之后不再有请求覆盖用户的输入。
+ */
+const polling = useReviewPolling<WorkbenchResponse>({
+  fetchOnce: fetchWorkbench,
+  isSettled: (data) => reviewPhase(data.task) !== 'processing',
+  onData: (data) => {
+    workbench.value = data
+    loading.value = false
+    seedReviewDrafts(data)
+  },
+  onError: (error) => {
+    workbench.value = null
+    loading.value = false
+    if (error instanceof ApiError && error.code === 'TASK_NOT_FOUND') {
+      notFound.value = true
+    } else {
+      // ⚠️ 不静默失败，也**不显示成"暂无数据"** —— 「没拿到数据」与「没有数据」
+      // 是两件事，混淆会让人以为合同真的没内容。
+      // 轮询在错误上**停止**（不会一边报错一边继续请求），页面给一个"重试"入口。
+      errorMessage.value = error instanceof ApiError ? error.message : '加载审查工作台失败'
+    }
+  },
+})
+
+/** 页面的任务形态。数据还没到时按"处理中"渲染（首屏就是等待状态）。 */
+const phase = computed<ReviewPhase>(() =>
+  workbench.value === null ? 'processing' : reviewPhase(workbench.value.task),
+)
+
+/**
+ * 顶部横幅的说明文字（未到终态时才显示，见模板）。
+ *
+ * ⚠️ 阻塞原因**只展示 ``block_reason_msg``**（上报方写的人话，P14-5-2 起由工作台
+ * 接口透出）。前端**不翻译** ``block_reason_code`` —— 把 ``UNSUPPORTED_FORMAT``
+ * 映射成一句中文，等于在前端再维护一份后端词表，两边迟早对不上且不会报错。
+ *
+ * 原因缺失时给的是**明确的兜底话术**（"服务端未提供具体原因"），而不是空串或
+ * ``null``：让用户以为"没有原因"与让用户看到一句半截的话，都不如如实说明。
+ */
+const phaseHint = computed<string>(() => {
+  const task = workbench.value?.task
+  if (task === undefined) {
+    return '正在读取审查状态……'
+  }
+  if (phase.value === 'blocked') {
+    // ``?.`` 同时兜住两种"没有原因"：接口明确给了 null，以及旧版接口压根没这个键
+    const reason = task.block_reason_msg?.trim()
+    return reason ? `原因：${reason}` : '审查已阻塞，服务端未提供具体原因'
+  }
+  return `当前阶段：${taskStageLabel(task.current_stage)}（进度 ${task.progress}%）。审查在后台进行，完成后本页会自动展示结果。`
+})
+
+/**
+ * 加载 / 刷新：立即取一次，任务没结束就继续轮询到结束为止。
+ * 首屏、工具栏的"刷新"、错误卡片上的"重试"都走这里，语义只有这一个。
+ */
+function load(): void {
   errorMessage.value = ''
   notFound.value = false
+  loading.value = true
 
   const id = taskId.value
   if (id === null) {
@@ -353,23 +444,7 @@ async function load(): Promise<void> {
     return
   }
 
-  try {
-    const data = await getReviewTaskWorkbench(id)
-    workbench.value = data
-    // 复核草稿必须跟着新数据重建 —— 否则刷新后会拿着上一份数据的草稿
-    seedReviewDrafts(data)
-  } catch (error) {
-    workbench.value = null
-    if (error instanceof ApiError && error.code === 'TASK_NOT_FOUND') {
-      notFound.value = true
-    } else {
-      // ⚠️ 不静默失败，也**不显示成"暂无数据"** —— 「没拿到数据」与「没有数据」
-      // 是两件事，混淆会让人以为合同真的没内容。
-      errorMessage.value = error instanceof ApiError ? error.message : '加载审查工作台失败'
-    }
-  } finally {
-    loading.value = false
-  }
+  polling.start()
 }
 
 function backToContracts(): void {
@@ -415,6 +490,23 @@ onMounted(load)
 
     <template v-else>
       <el-skeleton v-if="loading && !workbench" :rows="6" animated />
+
+      <!--
+        任务还没走到终态时的横幅（P14-5-1）。两种形态互斥：
+          · processing —— 图还在后台跑，页面每 1/2/3/5 秒问一次 Backend
+          · blocked    —— Agent 如实上报"这次跑挂了"，轮询已停
+        ⚠️ **没有** "status=pending 就是失败" 这种判断：pending 与 REVIEWED 并存
+        是 P9-10 冻结的正常组合，那是 reviewed 形态，不在这里显示。
+      -->
+      <el-alert
+        v-if="workbench && phase !== 'reviewed'"
+        class="workbench__phase"
+        :type="phase === 'blocked' ? 'error' : 'info'"
+        show-icon
+        :closable="false"
+        :title="phase === 'blocked' ? '审查任务已阻塞' : 'AI 正在审查中'"
+        :description="phaseHint"
+      />
 
       <template v-if="workbench">
         <!-- ---------------- 任务 ---------------- -->
@@ -760,6 +852,11 @@ onMounted(load)
 
 .risks__hint {
   margin-bottom: 8px;
+}
+
+/* 审查中 / 已阻塞的横幅（P14-5-1）：与下面各张卡片拉开一点距离 */
+.workbench__phase {
+  margin-bottom: 12px;
 }
 
 /* ---------------- 人工复核（P13-3） ---------------- */

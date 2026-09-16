@@ -19,6 +19,9 @@
 4. ``contract_metadata WHERE task_id = ? ORDER BY id``
 5. ``risk_item WHERE task_id = ? ORDER BY id``
 
+⚠️ 加字段**不等于**加查询：P14-5-2 新增的 ``block_reason_code`` / ``block_reason_msg``
+是 ``review_task`` 行上本来就有的两列，随第 1 条查询一起回来，因此条数仍然是 5。
+
 为什么不写一条大 JOIN
 ------------------
 ``blocks × clauses × metadata × risks`` 一条 join 出来是**笛卡尔积**
@@ -107,6 +110,10 @@ async def get_workbench(task_id: int) -> ReviewTaskWorkbenchResponse:
             finished_at=task.finished_at,
             risk_level_final=task.risk_level_final,
             conclusion=task.conclusion,
+            # P14-5-2：阻塞原因。⚠️ 这两列就在上面那条 ``_load_task_tree`` 取回的
+            # task 行上，**不新增任何 SELECT** —— 只是把已有行上的两列映射出来。
+            block_reason_code=task.block_reason_code,
+            block_reason_msg=task.block_reason_msg,
         ),
         contract=WorkbenchContract(
             contract_id=contract.id,

@@ -30,6 +30,50 @@ export function taskStageLabel(stage: string | null | undefined): string {
   return TASK_STAGE_LABELS[stage] ?? stage
 }
 
+/**
+ * 任务在界面上的**三种形态**（P14-5-1）。
+ *
+ * 判据只有两条，且**全部来自 Backend 已经返回的字段** —— 前端不猜、不推断、
+ * 不看时间戳：
+ *
+ * ================  ==========================================================
+ * ``blocked``       ``task.status === 'blocked'`` —— Agent 在后台如实上报的
+ *                   「这次跑挂了」（P14-4 的 ``POST .../block``）
+ * ``reviewed``      ``task.current_stage === 'REVIEWED'`` —— P9-10 冻结的语义：
+ *                   **AI 审查结果已持久化**。⚠️ 它与 ``status`` 无关，
+ *                   ``status=pending + current_stage=REVIEWED`` 是**正常组合**
+ * ``processing``    其余 —— 图还在后台跑（或还没开始）
+ * ================  ==========================================================
+ *
+ * ⚠️ **``blocked`` 必须排在最前面**：任务被阻塞时 ``current_stage`` 会停在它当时
+ * 走到的位置（``CLAUSED`` 甚至 ``UPLOADED``），不会自己跳到 ``REVIEWED``。
+ *
+ * ⚠️ 为什么**不**拿 ``status`` 单独当进度信号：P10 的裁决是只推阶段、不动状态机，
+ * 因此 ``status`` 会长期停在 ``pending``（见 ``api/workbench.ts`` 的说明）。
+ * 用它判断"还在处理"，会让一个已经审完的任务永远显示成处理中。
+ *
+ * 为什么放在 ``constants/`` 而不是 ``api/workbench.ts``：它是**由字段推导出的业务
+ * 形态**（词表的一部分），不是 HTTP 层的东西；而且页面测试会把 ``api/workbench``
+ * 整个替换成替身，纯函数留在那里会连它一起被替掉。
+ */
+export type ReviewPhase = 'processing' | 'reviewed' | 'blocked'
+
+/**
+ * 由任务字段推导页面形态。
+ *
+ * 参数写成**结构类型**而不是 ``WorkbenchTask``：本函数只用到两个字段，
+ * 收窄入参让它不依赖 API 模块，也便于单测直接喂最小对象。
+ */
+export function reviewPhase(task: { status: string; current_stage: string }): ReviewPhase {
+  if (task.status === 'blocked') {
+    return 'blocked'
+  }
+  if (task.current_stage === 'REVIEWED') {
+    return 'reviewed'
+  }
+  return 'processing'
+}
+
 /** Backend ``RiskReviewStatus`` → 中文展示名（P13-3）。 */
 export const RISK_REVIEW_STATUS_LABELS: Record<string, string> = {
   PENDING: '待复核',

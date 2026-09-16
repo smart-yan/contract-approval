@@ -34,6 +34,22 @@ export interface ApiErrorBody {
   request_id?: string | null
 }
 
+/**
+ * **Agent 服务**在启动阶段拒绝时的响应体（P14-4）。
+ *
+ * ⚠️ 它**不是**上面那个统一错误体：Agent 与 Backend 是两个独立服务，各自定义
+ * 自己的契约，字段名因此不同（``error_code`` / ``error_message``，见
+ * ``ai-agent/app/schemas/review.py`` 的 ``ReviewRunResponse``）。
+ *
+ * 这里只在**读取侧**多认一个别名，不去动 Agent 的契约、也不要求 Backend 增加字段 ——
+ * "谁产出的错误、用什么字段"由各自的服务决定，前端负责把它们归一成同一个
+ * :class:`ApiError` 给业务层用。
+ */
+export interface AgentRejectionBody {
+  error_code?: string | null
+  error_message?: string | null
+}
+
 /** 归一化后的错误。业务代码只需 `catch (e) { if (e instanceof ApiError) ... }`。 */
 export class ApiError extends Error {
   readonly code: string
@@ -89,13 +105,17 @@ request.interceptors.request.use((config: InternalAxiosRequestConfig) => {
 
 request.interceptors.response.use(
   (response: AxiosResponse) => response,
-  (error: AxiosError<ApiErrorBody>) => {
+  (error: AxiosError<ApiErrorBody & AgentRejectionBody>) => {
     const response = error.response
     const body = response?.data
 
-    // 后端返回了统一错误体 → 用它的 code/message；否则是网络层错误 → 用 axios 的错误码
-    const code = body?.code ?? (error.code === 'ECONNABORTED' ? 'REQUEST_TIMEOUT' : 'NETWORK_ERROR')
-    const message = body?.message ?? error.message ?? '请求失败'
+    // 统一错误体 → 用它的 code/message；没有则试 Agent 的别名字段；
+    // 两样都没有说明这不是业务错误（FastAPI 校验失败、网络层失败）→ 用 axios 的错误码
+    const code =
+      body?.code ??
+      body?.error_code ??
+      (error.code === 'ECONNABORTED' ? 'REQUEST_TIMEOUT' : 'NETWORK_ERROR')
+    const message = body?.message ?? body?.error_message ?? error.message ?? '请求失败'
 
     return Promise.reject(
       new ApiError({

@@ -21,6 +21,13 @@
                     │                              │
               persist_risks → REVIEWED      调 Backend 标 BLOCKED
 
+``②之后的清理责任``（P14-5-4）
+--------------------------
+② 之后磁盘上就有一个临时文件了，因此从那一刻到"责任交出去"为止，**本模块负责删它**：
+③④ 被包在同一个 ``try/finally`` 里，``handed_over`` 是唯一的分界 —— 预上传被拒、
+缺少 ``task_id``、请求**被取消**（uvicorn 优雅关闭超时就会 cancel 请求任务），
+三种结局都会走 ``finally`` 删掉它；只有 ``background.start()`` 成功才把责任交给后台。
+
 为什么改成异步（P14-4）
 --------------------
 真实 DeepSeek 调用实测单次 7~9 秒、整条链路同量级（P14-2）。这个量级下浏览器
@@ -87,6 +94,12 @@ async def _spool_to_temp(upload: UploadFile, suffix: str) -> Path:
     """把上传流分块写入临时文件，返回其路径。
 
     失败时自行清理已创建的临时文件，不把垃圾留给调用方。
+
+    ⚠️ 这里捕获的是 ``BaseException`` 而不是 ``Exception``（P14-5-4）：
+    ``asyncio.CancelledError`` 自 Python 3.8 起继承自 **``BaseException``**，
+    只写 ``except Exception`` 会让"请求被取消"**绕过**这段清理 ——
+    而那时 ``mkstemp`` 早就把文件建出来了（取消点通常落在下面的读/写上），
+    于是磁盘上留下一个谁也不认领的空壳文件。
     """
     fd, name = tempfile.mkstemp(prefix="agent-upload-", suffix=suffix)
     path = Path(name)
@@ -95,7 +108,9 @@ async def _spool_to_temp(upload: UploadFile, suffix: str) -> Path:
             while chunk := await upload.read(UPLOAD_CHUNK_SIZE):
                 # 本地文件写入是同步阻塞 IO，放到线程池（与 Backend 同样的理由）
                 await asyncio.to_thread(fp.write, chunk)
-    except Exception:
+    except BaseException:
+        # 取消时这个 await 仍会跑完：``to_thread`` 的线程不因取消而中止，
+        # 因此文件确实会被删掉，CancelledError 也照常继续向上抛
         await asyncio.to_thread(path.unlink, True)
         raise
     return path
@@ -104,11 +119,16 @@ async def _spool_to_temp(upload: UploadFile, suffix: str) -> Path:
 async def _discard_temp_file(path: Path) -> None:
     """删掉落盘的临时上传文件（幂等：文件已经不在了也算成功）。
 
-    临时文件的删除有两个触发点，**互斥**且都走这里：
+    临时文件的删除有**三个**触发点，**互斥**且都走这里 ——
+    它们合起来覆盖"这个文件可能经历的全部结局"：
 
-    * 协程**跑起来了** → :func:`_execute_review` 的 ``finally``
-    * 协程**还在排队就被放弃** → :meth:`BackgroundReviews.start` 的 ``on_abandon``
-      （那时 ``finally`` 根本没机会执行）
+    ==========================  ================================================
+    请求在**登记后台任务之前**结束  ``run_review`` 自己的 ``finally``
+    （预上传被拒 / 被取消）          （见那里的"责任转移"说明，P14-5-4）
+    后台协程**跑起来了**            :func:`_execute_review` 的 ``finally``
+    后台协程**排队时就被放弃**      :meth:`BackgroundReviews.start` 的 ``on_abandon``
+                                  （那时它的 ``finally`` 根本没机会执行）
+    ==========================  ================================================
     """
     await asyncio.to_thread(path.unlink, True)
 
@@ -424,64 +444,82 @@ async def run_review(
     filename = file.filename or "unnamed"
     content_type = file.content_type
     temp_path = await _spool_to_temp(file, Path(filename).suffix.lower())
-    await file.close()
 
-    # ---- ③ 预上传：把任务建出来，202 才有 task_id 可给 ----
-    # ``task_id`` 是图内的 ``upload_file`` 节点创建的，而 202 必须在图开始**之前**
-    # 返回 —— 那一刻库里什么都还没有，所以这里先自己调一次领取接入接口。
-    # 图的 ``upload_file`` 随后会因 ``sha256`` 幂等命中**同一个**任务（P4 冻结语义）。
-    outcome = await backend.upload_contract(
-        file_path=temp_path,
-        filename=filename,
-        contract_no=contract_no,
-        title=title,
-        contract_type=contract_type,
-        content_type=content_type,
-    )
-    if not outcome.ok:
-        await asyncio.to_thread(temp_path.unlink, True)
-        return _rejected_before_start(
-            response,
-            outcome.error_code or AgentErrorCode.BACKEND_REJECTED.value,
-            outcome.error_message or "预上传失败",
-        )
+    # ---- ③ / ④：预上传 → 登记后台任务 ----
+    #
+    # ⚠️ **清理责任从这一行开始归本函数**（P14-5-4 的"责任转移"）：
+    # 文件已经在磁盘上了，而"将来谁来删它"此刻还没定下来。中途任何一个出口 ——
+    # 预上传被拒、缺 task_id、**被取消** —— 都不能留下这个文件。
+    #
+    # 取消在这里并非理论问题：uvicorn 的优雅关闭超过 ``timeout_graceful_shutdown``
+    # 后会对仍在跑的请求任务逐个 ``t.cancel(...)``，而取消点很可能正落在下面的
+    # ``await upload_contract(...)``（它是整段里最慢的一步）。
+    #
+    # ``handed_over`` 是唯一的责任分界：
+    #   * 直到 ``background.start()`` 返回之前都是 False → 这个 finally 负责删
+    #   * 登记成功之后置 True → 责任交给后台（跑起来由它的 finally 删，
+    #     排队时被取消由它的 ``on_abandon`` 删）
+    # 两条路**互斥**，因此不会出现"后台还在读、endpoint 已经把它删了"。
+    handed_over = False
+    try:
+        await file.close()
 
-    task_id = (outcome.payload or {}).get("review_task_id")
-    if not isinstance(task_id, int):
-        # 2xx 但缺了继续下去必需的字段 —— 与"规则集映不成快照"同一类问题
-        await asyncio.to_thread(temp_path.unlink, True)
-        return _rejected_before_start(
-            response,
-            AgentErrorCode.BACKEND_CONTRACT_INCOMPLETE.value,
-            "Backend 的接入响应里没有 review_task_id，无法启动后台审查",
-        )
-
-    # ---- ④ 登记后台任务，立刻返回 ----
-    # ⚠️ 临时文件交给后台删 —— 请求返回时图还没跑完。
-    # 两条互斥的路径覆盖它的全部结局：**跑起来了**由协程自己的 ``finally`` 删；
-    # **还在排队就被取消**（shutdown）时协程一次都没被 await 过，``finally``
-    # 不会执行，因此这里额外登记 ``on_abandon`` 兜住那一半 —— 否则临时目录里
-    # 会留下一份合同副本。见 ``app/background.py`` 的说明。
-    background.start(
-        _execute_review(
-            graph=graph,
-            backend=backend,
-            llm=llm_provider,
-            task_id=task_id,
-            temp_path=temp_path,
+        # 预上传：``task_id`` 是图内的 ``upload_file`` 节点创建的，而 202 必须在图
+        # 开始**之前**返回 —— 那一刻库里什么都还没有，所以这里先自己调一次接入接口。
+        # 图的 ``upload_file`` 随后会因 ``sha256`` 幂等命中**同一个**任务（P4 冻结语义）。
+        outcome = await backend.upload_contract(
+            file_path=temp_path,
             filename=filename,
-            content_type=content_type,
             contract_no=contract_no,
             title=title,
             contract_type=contract_type,
-            rule_snapshot=rule_snapshot,
-        ),
-        name=f"review:{task_id}",
-        on_abandon=lambda: _discard_temp_file(temp_path),
-    )
+            content_type=content_type,
+        )
+        if not outcome.ok:
+            return _rejected_before_start(
+                response,
+                outcome.error_code or AgentErrorCode.BACKEND_REJECTED.value,
+                outcome.error_message or "预上传失败",
+            )
 
-    response.status_code = status.HTTP_202_ACCEPTED
-    return ReviewAcceptedResponse(task_id=task_id)
+        task_id = (outcome.payload or {}).get("review_task_id")
+        if not isinstance(task_id, int):
+            # 2xx 但缺了继续下去必需的字段 —— 与"规则集映不成快照"同一类问题
+            return _rejected_before_start(
+                response,
+                AgentErrorCode.BACKEND_CONTRACT_INCOMPLETE.value,
+                "Backend 的接入响应里没有 review_task_id，无法启动后台审查",
+            )
+
+        # 登记后台任务，立刻返回（⚠️ 这一步**没有 await**，因此不存在
+        # "任务建出来了但责任还没交出去"的中间态）
+        background.start(
+            _execute_review(
+                graph=graph,
+                backend=backend,
+                llm=llm_provider,
+                task_id=task_id,
+                temp_path=temp_path,
+                filename=filename,
+                content_type=content_type,
+                contract_no=contract_no,
+                title=title,
+                contract_type=contract_type,
+                rule_snapshot=rule_snapshot,
+            ),
+            name=f"review:{task_id}",
+            on_abandon=lambda: _discard_temp_file(temp_path),
+        )
+        handed_over = True
+
+        response.status_code = status.HTTP_202_ACCEPTED
+        return ReviewAcceptedResponse(task_id=task_id)
+    finally:
+        # ⚠️ 只能在 finally 里做：取消（``BaseException``）会绕过 ``except``，
+        # 而"文件已经创建"这件事与"这次请求后来怎么了"无关。
+        # 这个 await 在取消传播期间照样会跑完 —— ``to_thread`` 的线程不因取消而中止。
+        if not handed_over:
+            await _discard_temp_file(temp_path)
 
 
 __all__ = ["UPLOAD_CHUNK_SIZE", "router", "run_review"]

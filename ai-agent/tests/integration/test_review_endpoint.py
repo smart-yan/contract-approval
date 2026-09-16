@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import tempfile
+import threading
 from collections.abc import Callable, Coroutine, Iterator
 from contextlib import ExitStack
 from importlib import import_module
@@ -670,6 +671,70 @@ def test_upload_temp_file_is_removed_after_the_request(
     assert not created[0].exists(), "后台跑完后临时文件必须被删除"
 
 
+def test_a_request_cancelled_before_registration_still_cleans_up_its_upload(
+    agent: Callable[[Handler], TestClient],
+) -> None:
+    """**W2 窗口**：文件已落盘、后台任务**还没登记**时请求被取消。
+
+    这是 P14-5-4 修的泄漏缺口。真实可达路径是 **uvicorn 的优雅关闭超时**
+    （``uvicorn/server.py``：超过 ``timeout_graceful_shutdown`` 后对仍在跑的请求
+    任务逐个 ``t.cancel(...)``）。取消点落在"预上传"这个 await 上时，文件**已经**
+    躺在磁盘上，而此刻它还没有任何清理责任人 —— 不修就是永久残留。
+
+    ⚠️ 这里制造的是**真实的 task.cancel()**，不是抛一个假异常：把预上传卡在事件上，
+    再从事件循环里取消那个请求任务 —— 与 uvicorn 做的是同一件事。
+    """
+    backend = _Backend()
+    test_client = agent(backend.handler)
+
+    reached_upload = threading.Event()
+    captured: dict[str, Any] = {}
+    # 卡住预上传：请求停在这个 await 上，等来的不是结果而是取消
+    stall = asyncio.Event()
+
+    async def stalled_upload(**kwargs: Any) -> Any:
+        captured["task"] = asyncio.current_task()
+        captured["path"] = kwargs["file_path"]
+        reached_upload.set()
+        await stall.wait()  # pragma: no cover - 永远不会被放行
+        raise AssertionError("预上传不该返回：这个用例只验证取消路径")
+
+    app.state.backend_client.upload_contract = stalled_upload
+
+    outcome: dict[str, Any] = {}
+
+    def do_post() -> None:
+        try:
+            outcome["response"] = test_client.post(
+                "/api/agent/review",
+                files={
+                    "file": (
+                        "contract.docx",
+                        DOCX_BYTES,
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    )
+                },
+                data={"contract_no": "HT-2026-001", "title": "设备采购合同", "contract_type": "PURCHASE"},
+            )
+        except BaseException as exc:  # noqa: BLE001 - 取消会以哪种异常冒出来不由本用例规定
+            outcome["exc"] = exc
+
+    # 请求必须在**另一个线程**里发：主线程要留着去取消它
+    thread = threading.Thread(target=do_post, daemon=True)
+    thread.start()
+    assert reached_upload.wait(timeout=10), "请求应当已经走到预上传"
+
+    temp_path = Path(captured["path"])
+    assert temp_path.exists(), "取消之前，临时文件确实已经在磁盘上"
+
+    test_client.portal.call(captured["task"].cancel)
+    thread.join(timeout=15)
+
+    assert not thread.is_alive(), "被取消之后请求应当结束"
+    assert not temp_path.exists(), "请求在登记后台任务之前被取消，endpoint 必须自己清理临时文件"
+    assert app.state.background_reviews.active_count == 0, "不该留下孤儿后台任务"
+
+
 def test_temp_file_is_also_removed_when_backend_rejects(
     agent: Callable[[Handler], TestClient], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -954,15 +1019,21 @@ def test_a_cancelled_running_review_reports_blocked_then_propagates(
 
     ⚠️ "取消继续传播"这件事只能这样观察：任务最终处于 ``cancelled``，
     而不是被当成正常结束 —— 吞掉取消会让 asyncio 与登记处都看不出它没跑完。
+
+    ⚠️ 这里同时钉住**责任转移之后**的清理（P14-5-4）：登记成功的那一刻起，
+    临时文件归后台协程管 —— endpoint 的 ``finally`` 不许再碰它（那会把还在读的
+    文件删掉），而它自己的 ``finally`` 必须删。两件事在这一条用例里一起看。
     """
     backend = _Backend()
     gate = asyncio.Event()
     test_client = agent(backend.handler)
     registry = _saturate(test_client, gate)
+    before = _temp_uploads()
 
     _post(test_client, settle=False)
     test_client.portal.call(asyncio.sleep, 0.05)
     task = next(iter(registry._tasks))
+    assert len(_temp_uploads() - before) == 1, "图还在跑，临时文件必须还在（不能被 endpoint 提前删掉）"
 
     test_client.portal.call(registry.drain)
 
@@ -971,3 +1042,4 @@ def test_a_cancelled_running_review_reports_blocked_then_propagates(
     assert payload["block_reason_code"] == "AGENT_GRAPH_EXECUTION_FAILED"
     assert "中断" in payload["block_reason_msg"]
     assert task.cancelled(), "上报之后必须让取消继续传播，不能吞掉"
+    assert _temp_uploads() - before == set(), "跑起来之后被取消，由后台协程的 finally 负责删"

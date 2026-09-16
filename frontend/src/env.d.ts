@@ -9,6 +9,8 @@
 interface ImportMetaEnv {
   /** 业务接口基础路径。见 .env.development（默认 /api/v1）。 */
   readonly VITE_API_BASE_URL: string
+  /** Agent 服务接口前缀。见 .env.development（默认 /api/agent）。 */
+  readonly VITE_AGENT_BASE_URL: string
 }
 
 interface ImportMeta {

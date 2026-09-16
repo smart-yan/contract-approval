@@ -40,6 +40,22 @@ export interface WorkbenchTask {
   risk_level_final: string | null
   /** 审查结论（§11.2）。当前恒为 null */
   conclusion: string | null
+  /**
+   * 阻塞原因枚举（Backend constants.BlockReasonCode）。**P14-5-2 新增字段**。
+   *
+   * ⚠️ 只有 ``status === 'blocked'`` 时才有值，其余任务恒为 null。
+   * ⚠️ 前端**不翻译**它：把 ``UNSUPPORTED_FORMAT`` 映射成一句中文等于在前端复制
+   * 一份后端词表，两边迟早对不上，而且翻译得对不对没人能验证。
+   * 要展示原因就展示 ``block_reason_msg``（那是上报方写的人话）。
+   */
+  block_reason_code: string | null
+  /**
+   * 阻塞原因的人话说明，由上报方（Agent 的 ``POST .../block``）写入。**P14-5-2 新增**。
+   *
+   * ⚠️ 与 ``block_reason_code`` 同生共死；没有原因时为 null —— 界面必须准备
+   * fallback 文案，不能显示成空白或 ``null``。
+   */
+  block_reason_msg: string | null
 }
 
 /** 合同主数据。 */

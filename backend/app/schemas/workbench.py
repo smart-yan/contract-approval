@@ -49,7 +49,17 @@ from pydantic import BaseModel, Field
 
 
 class WorkbenchTask(BaseModel):
-    """本次审查任务。"""
+    """本次审查任务。
+
+    ⚠️ 这里的 ``status`` / ``current_stage`` 是**两个独立的事实**，不要互相推导：
+
+    * ``current_stage`` = 「已完成到哪一步」（P10 只推它、不动状态机）
+    * ``status`` = 任务状态机（§6.1）
+
+    因此 ``status=pending + current_stage=REVIEWED`` 是**正常组合**（AI 审查结果
+    已持久化、但任务尚未被判定为"结束"），而 ``status=blocked`` 要配
+    ``block_reason_*`` 一起看 —— 前者说"出事了"，后者说"出的什么事"。
+    """
 
     task_id: int = Field(description="审查任务 ID")
     status: str = Field(description="任务状态，取值见 constants.TaskStatus")
@@ -74,6 +84,21 @@ class WorkbenchTask(BaseModel):
     )
     conclusion: str | None = Field(
         default=None, description="审查结论（§11.2）。⚠️ 当前恒为 NULL —— 评分器尚未实现"
+    )
+
+    # ---------------------------- 阻塞原因（P14-5-2）---------------------------- #
+    # 这两列由 P14-4 的 ``POST /review-tasks/{task_id}/block`` 写入（Agent 在后台
+    # 跑图失败时如实上报），但**当时没有加进本 DTO** —— 于是前端只看得见
+    # ``status == 'blocked'``，看不见"为什么"。P14-5-2 把它们透出来。
+    block_reason_code: str | None = Field(
+        default=None,
+        description="阻塞原因枚举，取值见 constants.BlockReasonCode（§6.1）。"
+        "⚠️ 只对 ``status == 'blocked'`` 的任务有意义；其余任务恒为 NULL",
+    )
+    block_reason_msg: str | None = Field(
+        default=None,
+        description="阻塞原因的人话说明（由上报方写入，前端直接展示）。"
+        "⚠️ 与 ``block_reason_code`` 同生共死：两者要么都有值，要么都是 NULL",
     )
 
 

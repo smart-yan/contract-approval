@@ -23,6 +23,7 @@ from dataclasses import dataclass
 import pymysql
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import event
 
 from app.core.config import get_settings
 from app.main import app
@@ -371,6 +372,83 @@ def test_the_task_carries_the_p10_null_fields_as_null(client: TestClient, scene:
     assert task["conclusion"] is None
 
 
+def test_a_normal_task_carries_no_block_reason(client: TestClient, scene: Scenario) -> None:
+    """没被阻塞的任务：两个字段**在响应里**、值为 null（不是缺键）。
+
+    ⚠️ "键存在且为 null"与"没有这个键"对前端是两回事：后者会让
+    ``task.block_reason_code`` 变成 undefined，与"服务端明确说没有原因"混在一起。
+    """
+    task = _get(client, scene.task_id)["task"]
+
+    assert "block_reason_code" in task
+    assert "block_reason_msg" in task
+    assert task["block_reason_code"] is None
+    assert task["block_reason_msg"] is None
+
+
+def test_the_query_count_stays_five(client: TestClient, scene: Scenario) -> None:
+    """**加字段不加查询**：无论响应里多出几列，这条路径始终是 5 条 SELECT。
+
+    ⚠️ 这条断言针对的是本模块 docstring 里写死的那条设计约束（不是"越少越好"的
+    泛泛之谈）：工作台一次要拼 7 份数据，一旦有人图省事在循环里补查询，
+    条数就会随数据量增长 —— 那种回归在功能测试里**完全看不出来**。
+
+    P14-5-2 的 ``block_reason_*`` 就是这条约束的实例：它们来自第 1 条查询已经
+    取回的 task 行，不应该、也没有多出一条查询。
+    """
+    from app.db.session import get_engine
+
+    statements: list[str] = []
+
+    def _record(conn, cursor, statement, parameters, context, executemany) -> None:
+        statements.append(statement.lstrip().split("\n")[0])
+
+    sync_engine = get_engine().sync_engine
+    event.listen(sync_engine, "before_cursor_execute", _record)
+    try:
+        _get(client, scene.task_id)
+    finally:
+        event.remove(sync_engine, "before_cursor_execute", _record)
+
+    selects = [s for s in statements if s.upper().startswith("SELECT")]
+    assert len(selects) == 5, f"应当是 5 条 SELECT，实际 {len(selects)} 条：{selects}"
+
+
+def test_a_blocked_task_carries_the_real_reason(client: TestClient, scene: Scenario) -> None:
+    """被阻塞的任务带着**真实**原因 —— 这正是前端展示"为什么被阻塞"的唯一来源。
+
+    走的是真实的写入路径（``POST .../block``，P14-4），不是直接改库：
+    "上报的原因"与"读出来的原因"必须是对同一份数据的两种看法。
+    """
+    response = client.post(
+        f"/api/v1/review-tasks/{scene.task_id}/block",
+        json={"block_reason_code": "UNSUPPORTED_FORMAT", "block_reason_msg": "该文件类型暂不支持"},
+    )
+    assert response.status_code == 200, response.text
+
+    task = _get(client, scene.task_id)["task"]
+
+    assert task["status"] == "blocked"
+    assert task["block_reason_code"] == "UNSUPPORTED_FORMAT"
+    assert task["block_reason_msg"] == "该文件类型暂不支持"
+    # 阻塞不改阶段（P14-4 冻结）：任务仍停在它当时走到的位置
+    assert task["current_stage"] == "CLAUSED"
+
+
+def test_the_block_reason_is_scoped_to_its_own_task(client: TestClient, scene: Scenario) -> None:
+    """阻塞一个任务，**另一个任务**的工作台不受影响（task 级隔离）。"""
+    client.post(
+        f"/api/v1/review-tasks/{scene.task_id}/block",
+        json={"block_reason_code": "FILE_CORRUPTED", "block_reason_msg": "文件损坏"},
+    )
+
+    other = _get(client, scene.other_task_id)["task"]
+
+    assert other["status"] == "pending"
+    assert other["block_reason_code"] is None
+    assert other["block_reason_msg"] is None
+
+
 # --------------------------------------------------------------------------- #
 # 3 / 4：blocks
 # --------------------------------------------------------------------------- #
@@ -597,7 +675,10 @@ def test_the_response_does_not_leak_internal_columns(client: TestClient, scene: 
         "worker_id",
         "heartbeat_at",
         "next_retry_at",
-        "block_reason_code",  # 队列/阻塞字段，属 P14
+        # ⚠️ ``block_reason_code`` / ``block_reason_msg`` **曾经**在这张清单里
+        # （P11 时它们是队列/阻塞的内部字段）。P14-5-2 把它们正式纳入工作台契约：
+        # 前端必须能显示"为什么被阻塞"，而不是从 ``status`` 猜。因此它们从
+        # "内部字段"挪到了 DTO —— 这里也就不能再断言它们不出现。
         "current_task_id",  # 合同：过期冗余字段
         "approval_instance_id",
         "applicant_id",
