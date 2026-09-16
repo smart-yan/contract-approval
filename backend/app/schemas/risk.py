@@ -33,9 +33,11 @@ Backend"的通道。
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from datetime import datetime
 
-from app.core.constants import AnchorMethod, RiskLevel, RiskSource
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from app.core.constants import AnchorMethod, RiskLevel, RiskReviewStatus, RiskSource
 
 
 class RiskItemCreate(BaseModel):
@@ -88,4 +90,94 @@ class RiskPersistResponse(BaseModel):
     task_stage: str = Field(description="更新后的任务阶段，取值见 constants.TaskStage")
 
 
-__all__ = ["RiskItemCreate", "RiskPersistRequest", "RiskPersistResponse"]
+# =========================================================================== #
+# 人工复核（P13-1）
+# =========================================================================== #
+class RiskReviewRequest(BaseModel):
+    """法务对**一条**风险的复核结论。
+
+    只改人工判断，**不改 AI 的判断内容**
+    ------------------------------------
+    请求体里能出现的字段只有下面三个。``risk_title`` / ``reason`` / ``legal_basis`` /
+    ``original_text`` / ``paragraph_index`` / ``clause_id`` / ``rule_id`` / ``task_id`` /
+    ``contract_id`` …… 一律**不在契约里**，而且 ``extra="forbid"`` 让它们连传都传不进来
+    （见下方"为什么是 forbid 而不是忽略"）。
+
+    为什么 ``MODIFIED`` 必须带 ``risk_level``
+    ----------------------------------------
+    ``MODIFIED`` 的定义就是"法务调整了等级"（§6.3）。不带新等级的 ``MODIFIED``
+    与 ``CONFIRMED`` 无法区分，落库后谁也说不清"改了没有、改成什么"。
+
+    为什么 ``CONFIRMED`` / ``REJECTED`` **不能**带 ``risk_level``
+    ------------------------------------------------------------
+    这两种结论的语义是"AI 判的没错"与"AI 判错了"，它们**不包含**等级修订。
+    允许顺带改等级，等于给"只想确认一下"的调用方留了一条静默改写等级的路径 ——
+    而等级直接决定报告里的风险分布，且**不会报错**。
+
+    为什么是 ``forbid`` 而不是默认的忽略
+    ----------------------------------
+    Pydantic 默认忽略未知字段。那意味着调用方发一个 ``risk_title`` 会拿到 **200**，
+    然后以为标题改成功了 —— 实际上服务端一个字都没动。``forbid`` 让这类误用
+    在第一次调用时就以 422 暴露出来。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    review_status: RiskReviewStatus = Field(
+        description="复核结论，取值见 constants.RiskReviewStatus。"
+        "**不接受 `PENDING`** —— 它是 AI 产出时的初始状态，把一条已复核的风险"
+        "改回 `PENDING` 等于抹掉复核痕迹，而这个接口没有历史记录可查"
+    )
+    review_comment: str | None = Field(default=None, description="复核意见（可选）")
+    risk_level: RiskLevel | None = Field(
+        default=None,
+        description="人工修订后的风险等级。**仅当 `review_status = MODIFIED` 时必填**；"
+        "`CONFIRMED` / `REJECTED` 携带它会被拒绝",
+    )
+
+    @model_validator(mode="after")
+    def _check_rules(self) -> RiskReviewRequest:
+        if self.review_status is RiskReviewStatus.PENDING:
+            raise ValueError(
+                "review_status 不能是 PENDING：PENDING 是 AI 产出时的初始状态，"
+                "把它作为复核结果等于抹掉复核痕迹"
+            )
+
+        if self.review_status is RiskReviewStatus.MODIFIED:
+            if self.risk_level is None:
+                raise ValueError("review_status 为 MODIFIED 时必须提供新的 risk_level")
+        elif self.risk_level is not None:
+            raise ValueError(
+                f"review_status 为 {self.review_status.value} 时不允许修改 risk_level —— "
+                "只有 MODIFIED 才表示法务调整了等级"
+            )
+
+        return self
+
+
+class RiskReviewResponse(BaseModel):
+    """复核写入后，该风险项的复核相关状态（即库里的实际值）。"""
+
+    risk_id: int = Field(description="风险项 ID")
+    task_id: int = Field(description="所属审查任务 ID")
+    risk_level: str = Field(description="当前风险等级（MODIFIED 时是人工修订后的值）")
+    review_status: str = Field(description="复核状态，取值见 constants.RiskReviewStatus")
+    review_comment: str | None = Field(default=None, description="复核意见")
+    reviewer_id: int | None = Field(
+        default=None,
+        description="复核人。⚠️ **当前恒为 null** —— 项目没有 `sys_user` 表，"
+        "也没有登录/JWT/RBAC（§15 明确不做）。服务端**不伪造**一个用户 id 来填这一列",
+    )
+    reviewed_at: datetime = Field(
+        description="复核时刻。**服务端生成的 naive UTC**（见 app.utils.datetime_utils），"
+        "不接受客户端指定"
+    )
+
+
+__all__ = [
+    "RiskItemCreate",
+    "RiskPersistRequest",
+    "RiskPersistResponse",
+    "RiskReviewRequest",
+    "RiskReviewResponse",
+]

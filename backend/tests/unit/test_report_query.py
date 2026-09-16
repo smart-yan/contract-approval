@@ -105,6 +105,9 @@ def make_risk_row(**overrides: Any) -> SimpleNamespace:
             "clause_id": 100,
             "locator_type": "PARAGRAPH",
             "review_status": "PENDING",
+            # 人工复核的补充两列（P13-4）。未复核的历史数据就是这两个 NULL
+            "review_comment": None,
+            "reviewed_at": None,
         },
         overrides,
     )
@@ -277,6 +280,34 @@ def test_a_nullable_risk_field_is_not_filled_in() -> None:
     assert risk.legal_basis is None
     assert risk.original_text is None
     assert risk.clause_id is None
+
+
+def test_the_review_columns_are_mapped_with_real_values() -> None:
+    """P13-4：人工复核三列要原样搬到 ``ReportRisk``。
+
+    ⚠️ 用**非空**值断言 —— 默认行里这三列是 NULL，``None == None`` 会让
+    "漏搬一列"这种错误照样通过。
+    """
+    row = make_risk_row(
+        review_status="MODIFIED",
+        review_comment="等级下调",
+        reviewed_at=naive_utc(2026, 9, 16, 8, 12),
+    )
+
+    risk = assemble(risks=[row]).risks[0]
+
+    assert risk.review_status == "MODIFIED"
+    assert risk.review_comment == "等级下调"
+    assert risk.reviewed_at == naive_utc(2026, 9, 16, 8, 12)
+
+
+def test_an_unreviewed_risk_maps_to_nulls_not_placeholders() -> None:
+    """未复核的历史数据原样搬 NULL —— 不写"无"、不写空串。"""
+    risk = assemble().risks[0]
+
+    assert risk.review_status == "PENDING"
+    assert risk.review_comment is None
+    assert risk.reviewed_at is None
 
 
 def test_metadata_keeps_only_the_display_columns() -> None:

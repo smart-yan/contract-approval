@@ -45,6 +45,26 @@ const SAMPLE: WorkbenchResponse = {
   risks: [],
 }
 
+/** 一条**已复核**的风险 —— 复核四列都带实际值（P13-2 新增的 DTO 字段）。 */
+const REVIEWED_RISK: WorkbenchResponse['risks'][number] = {
+  risk_id: 900,
+  risk_code: 'IP_OWNER_SUPPLIER_001',
+  risk_title: '知识产权归属相对方',
+  dimension: '知识产权',
+  risk_level: 'LOW',
+  source: 'RULE',
+  reason: '成果归属供方会限制我方后续使用。',
+  legal_basis: null,
+  original_text: '知识产权归乙方',
+  paragraph_index: 23,
+  clause_id: 100,
+  locator_type: 'PARAGRAPH',
+  review_status: 'MODIFIED',
+  reviewer_id: null,
+  review_comment: '等级下调',
+  reviewed_at: '2026-09-16T08:12:34.567',
+}
+
 describe('getReviewTaskWorkbench()', () => {
   it('调用 Backend 的 GET /api/v1/review-tasks/{taskId}/workbench', async () => {
     // request 实例的 baseURL 是 /api/v1，因此这里传的是相对路径；
@@ -69,6 +89,30 @@ describe('getReviewTaskWorkbench()', () => {
     vi.spyOn(request, 'get').mockResolvedValue({ data: SAMPLE })
 
     await expect(getReviewTaskWorkbench(42)).resolves.toEqual(SAMPLE)
+  })
+
+  it('复核字段原样透传：PENDING 是三个 null，已复核带实际值（P13-2）', async () => {
+    // 「未复核」与「已复核」是前端必须能表达的两态。这条用例的价值不在断言本身
+    // （本层就是个透传），而在于**它必须通过类型检查** —— 两个样本都写成
+    // ``WorkbenchResponse``，少一个复核字段 ``npm run build`` 就会失败。
+    const pendingRisk = { ...REVIEWED_RISK, review_status: 'PENDING', review_comment: null, reviewed_at: null }
+    const reviewedRisk = { ...REVIEWED_RISK }
+
+    vi.spyOn(request, 'get').mockResolvedValue({
+      data: { ...SAMPLE, risks: [pendingRisk, reviewedRisk] },
+    })
+
+    const result = await getReviewTaskWorkbench(42)
+
+    // 未复核：三个复核列都是 null，且 reviewer_id 与复核与否无关（恒 null）
+    expect(result.risks[0]!.reviewer_id).toBeNull()
+    expect(result.risks[0]!.review_comment).toBeNull()
+    expect(result.risks[0]!.reviewed_at).toBeNull()
+    // 已复核：实际值原样带回，时间串**不做任何格式化**
+    expect(result.risks[1]!.review_status).toBe('MODIFIED')
+    expect(result.risks[1]!.review_comment).toBe('等级下调')
+    expect(result.risks[1]!.reviewed_at).toBe('2026-09-16T08:12:34.567')
+    expect(result.risks[1]!.reviewer_id).toBeNull()
   })
 
   it('请求失败时把错误抛出去，由页面区分 404 与其它错误', async () => {

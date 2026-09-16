@@ -127,8 +127,35 @@ export interface WorkbenchRisk {
   paragraph_index: number | null
   clause_id: number | null
   locator_type: string
-  /** 人工复核状态。当前恒为 PENDING（人工复核属 P13） */
+
+  // ---------------------------- 人工复核（P13-2）----------------------------
+  // 这四个是**人工判断**，与上面的 AI 产出取自同一行。前端要把两个来源分开呈现：
+  // AI 说了什么（risk_title / reason / legal_basis / original_text）不可改，
+  // 法务怎么看（下面这四个）才是复核 UI 的写入面。
+  /**
+   * 人工复核状态（Backend `constants.RiskReviewStatus`）：
+   * `PENDING` / `CONFIRMED` / `REJECTED` / `MODIFIED`。
+   * AI 刚产出时是 `PENDING`。
+   */
   review_status: string
+  /**
+   * 复核人。
+   *
+   * ⚠️ **当前恒为 `null`** —— 项目没有 `sys_user` 表、也没有登录/JWT/RBAC，
+   * Backend 刻意不伪造一个用户 id 来填它。前端**不要**为它编一个显示值
+   * （"未知用户"这类占位同样是编的）。
+   */
+  reviewer_id: number | null
+  /** 复核意见；法务没写时为 null */
+  review_comment: string | null
+  /**
+   * 复核时刻。
+   *
+   * ⚠️ 与 `task.created_at` 是同一种串：**naive UTC**（没有 `Z`、没有时区偏移）。
+   * 展示前请用 `@/utils/datetime` 的 `formatUtcTimestamp`，否则东八区会凭空少 8 小时。
+   * 未经复核时为 `null`。
+   */
+  reviewed_at: string | null
 }
 
 /** 工作台的全部数据。 */

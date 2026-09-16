@@ -182,7 +182,12 @@ async def get_workbench(task_id: int) -> ReviewTaskWorkbenchResponse:
                 paragraph_index=risk.paragraph_index,
                 clause_id=risk.clause_id,
                 locator_type=risk.locator_type,
+                # 人工复核四列（P13-2）：与 AI 产出的字段取自**同一行**，不需要额外
+                # 查询 —— ``_load_risks`` 取的就是完整的 RiskItem
                 review_status=risk.review_status,
+                reviewer_id=risk.reviewer_id,
+                review_comment=risk.review_comment,
+                reviewed_at=risk.reviewed_at,
             )
             for risk in risks
         ],

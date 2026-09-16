@@ -22,11 +22,34 @@
 | P4 | 合同接入（storage 抽象 / SHA256 / 三层文件校验 / 幂等 / 并发竞争 / 孤儿清理 / 上传 API） | ✅ PASS（328 tests） |
 | P5-1 | AI Agent Preflight | ✅ PASS |
 | P5-2 | AI Agent 服务外壳（FastAPI + 配置 + 目录骨架 + 健康检查） | ✅ PASS |
-| **P5-3** | **最小 LangGraph（State + 3 个节点 + Conditional Edge）** | **✅ PASS** |
+| P5-3 | 最小 LangGraph（State + 3 个节点 + Conditional Edge） | ✅ PASS |
+| P6 | 文档解析（`DocumentParser` 抽象 + `DocxParser`，段落/表格按 XML 顺序，块与全局偏移） | ✅ PASS |
+| P7 | 理解层（条款识别 / 元数据提取 / 关键词提取） | ✅ PASS |
+| P8 | 规则审查（规则目录 API + 求值引擎：KEYWORD / REGEX / THRESHOLD） | ✅ PASS |
+| P9 | LLM 审查 + 风险合并（Provider + JSON 守卫 + quote 定位 + 统一风险模型 + 合并） | ✅ PASS |
+| P9-10 | 风险持久化（整批原子写入 + 阶段门禁 + 行锁） | ✅ PASS |
+| P10 | 文档持久化（block / clause / metadata 落库，图收敛为 11 节点） | ✅ PASS |
+| P11 | 前端工作台（合同列表 + 工作台双栏 + 风险卡片 → 原文滚动高亮） | ✅ PASS |
+| P12 | 报告导出（Markdown 报告 + RFC 5987 中文文件名下载） | ✅ PASS |
+| P13 | 人工复核（复核 PATCH API + 工作台复核 UI + 报告复核标注） | ✅ PASS（`P13-1` ~ `P13-4` 已评审冻结；`P13-5` 收尾中） |
 
-> **当前状态：P4 与 P5-1 ~ P5-3 已完成并验证，但 Git HEAD 仍停在 `dc62d05`（P3）—— 这些成果尚未提交。**
+> **当前状态**：P4 ~ P12 已提交（Git HEAD = `65a59a7`）。
+> **P13 的成果尚未提交** —— 将在 P13 整体收尾后一次性提交。
 >
-> 尚未实现的业务：文档解析、OCR、条款识别、元数据提取、关键词提取、规则引擎、LLM 审查、风险合并、修改建议、报告生成、任务 Worker、人工复核、审批回写、报告导出。
+> 尚未实现的业务：OCR（扫描件）、修改建议生成（`risk_suggestion`）、任务 Worker 与状态机、
+> 审批回写、异常演练与联调、前端文档预览。
+>
+> 全部测试基线（P13-5 时点）：Backend **782 passed**、Agent **1021 passed**、Frontend **127 passed**。
+
+### 已知技术债（已接受，不在当时阶段内修复）
+
+| # | 技术债 | 说明 |
+|---|---|---|
+| 1 | **人工改等级会覆盖 AI 原始值** | 人工复核（P13）采用 Scheme A：直接就地改写 `risk_item`，不建复核历史表。因此 `MODIFIED` 之后**无法恢复 AI 原始风险等级**，报告的**风险概览按当前 `risk_item.risk_level` 统计**。已接受，不引入 `original_risk_level` / 历史表 / 迁移 |
+| 2 | **`reviewer_id` 恒为 NULL** | 系统尚未引入用户身份与权限体系（JWT / RBAC / `sys_user` 明确不做），因此复核人一列**保持为空**，不伪造任何用户名 |
+| 3 | 请求体校验错误未走统一错误体 | FastAPI 默认的 422 响应体是 `{"detail": [...]}`，没有 `code` / `message`，前端拦截器会把它归成 `NETWORK_ERROR`。前端按 `status === 422` 兜底，但拿不到后端那句精确文案 |
+| 4 | 路由白名单按**路径**比较 | `tests/unit/test_main_wiring.py` 的守卫抓不到"在已有路径上新增方法"（例如给 `/risks` 加 DELETE） |
+| 5 | 部分集成测试夹具的时区 | 8 个历史集成测试文件用裸 `pymysql` 直连，绕过了 `SET time_zone='+00:00'`，其 `NOW(3)` 写入的是本地时间。这些测试目前不做时间断言，故无假阳性（P12/P13 的新夹具已修正） |
 
 ---
 
@@ -374,7 +397,14 @@ contract_approval/
 | `5c0f93a` | P2-e frontend shell（P2-e） |
 | `b586b22` | feat: add contract review database models（P3） |
 | `dc62d05` | docs: update project progress through P3（P3 收尾） |
+| `c567c1d` | feat: complete contract ingestion and agent foundation（P4 / P5-1 ~ P5-3） |
+| `5e34042` | docs: revise architecture for agent service（架构文档改版） |
+| `2b78778` ~ `9c3bfc1` | 文档解析 → 条款 / 元数据 / 关键词（P6 / P7） |
+| `8421e9a` ~ `eaeff0e` | 规则目录 API + 规则求值引擎 + 规则审查节点（P8） |
+| `54f3640` ~ `8ed3c21` | LLM Provider / JSON 守卫 / quote 定位 / 统一风险模型 / 风险合并（P9） |
+| `3086011` | feat: persist review risks to backend（P9-10） |
+| `18b0352` | feat: complete document persistence pipeline（P10） |
+| `e9e4f69` | feat: complete review workbench（P11） |
+| `65a59a7` | feat: complete markdown review report export（P12） ← **当前 HEAD** |
 
-> **P4 与 P5-1 ~ P5-3 的成果尚未提交**：Git HEAD 仍停在 `dc62d05`，
-> 工作区存在 24 项未提交变更（11 项修改 + 13 项未跟踪，含整个 `ai-agent/` 目录）。
-> 以上两个章节记录的内容均已在本机验证通过，但**不在版本库中**。
+> **P13（人工复核）的成果尚未提交**：将在 P13 整体收尾后一次性提交。

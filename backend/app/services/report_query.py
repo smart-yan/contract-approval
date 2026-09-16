@@ -316,7 +316,11 @@ def _assemble(
                 paragraph_index=risk.paragraph_index,
                 clause_id=risk.clause_id,
                 locator_type=risk.locator_type,
+                # 人工复核三列（P13-4）：与 AI 字段取自**同一行**，`_load_risks`
+                # 取的就是完整的 RiskItem，因此这里不需要多查一次
                 review_status=risk.review_status,
+                review_comment=risk.review_comment,
+                reviewed_at=risk.reviewed_at,
             )
             for risk in risks
         ),

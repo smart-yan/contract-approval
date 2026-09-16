@@ -115,6 +115,15 @@ class ErrorCode(StrEnum):
     #: 风险写入的前置缺失：任务还没走过文档层（``current_stage`` 未到 ``CLAUSED``）
     DOCUMENT_NOT_PERSISTED = "DOCUMENT_NOT_PERSISTED"
 
+    # ------------------------ 人工复核（P13） ------------------------ #
+    #: 目标风险不存在，**或它不属于路径里那个任务**。
+    #: ⚠️ 两种情形**共用同一个码**：分开表达等于告诉调用方"这个 id 在别的任务里存在"
+    RISK_NOT_FOUND = "RISK_NOT_FOUND"
+    #: 人工复核的前置缺失：任务还没审完（``current_stage`` 未到 ``REVIEWED``）。
+    #: 与 ``REPORT_NOT_READY`` 是同一条件的两个消费场景，但语义各说各的，
+    #: 因此不共用一个码（报告读的是分数，复核写的是结论）
+    RISK_REVIEW_NOT_READY = "RISK_REVIEW_NOT_READY"
+
     # ------------------------ 解析 / OCR ------------------------ #
     OCR_FAILED = "OCR_FAILED"
     OCR_LOW_QUALITY = "OCR_LOW_QUALITY"
@@ -202,6 +211,12 @@ ERROR_SPECS: dict[ErrorCode, ErrorSpec] = {
     #: 此时写入会产出 clause_id 全为 NULL 的风险，并让文档层永久无法补写
     ErrorCode.DOCUMENT_NOT_PERSISTED: ErrorSpec(
         409, ErrorCategory.USER_ERROR, "该任务尚未持久化文档层结果，无法写入风险"
+    ),
+    # ------------------------ 人工复核（P13） ------------------------ #
+    #: 措辞刻意**不区分**"不存在"与"属于别的任务"
+    ErrorCode.RISK_NOT_FOUND: ErrorSpec(404, ErrorCategory.USER_ERROR, "风险项不存在"),
+    ErrorCode.RISK_REVIEW_NOT_READY: ErrorSpec(
+        409, ErrorCategory.USER_ERROR, "该任务尚未完成风险审查，无法人工复核"
     ),
     # ------------------------ 解析 / OCR ------------------------ #
     ErrorCode.OCR_FAILED: ErrorSpec(422, ErrorCategory.SYSTEM_ERROR, "OCR 识别失败"),

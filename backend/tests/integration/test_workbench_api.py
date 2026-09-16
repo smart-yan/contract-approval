@@ -497,6 +497,50 @@ def test_the_risk_points_at_a_real_block(client: TestClient, scene: Scenario) ->
 
 
 # --------------------------------------------------------------------------- #
+# 11b：人工复核字段（P13-2）
+# --------------------------------------------------------------------------- #
+#: 复核相关的四列。工作台必须**全部**返回 —— 前端要靠它们把"AI 判断"与
+#: "法务判断"分开呈现（P13-3 的复核 UI 依赖这个契约）。
+REVIEW_FIELDS = ("review_status", "reviewer_id", "review_comment", "reviewed_at")
+
+
+def test_the_risk_dto_exposes_all_four_review_fields(client: TestClient, scene: Scenario) -> None:
+    for risk in _get(client, scene.task_id)["risks"]:
+        assert set(REVIEW_FIELDS) <= set(risk), f"缺少复核字段：{set(REVIEW_FIELDS) - set(risk)}"
+
+
+def test_an_unreviewed_risk_returns_nulls_for_the_review_details(
+    client: TestClient, scene: Scenario
+) -> None:
+    """AI 刚产出的风险：状态是 ``PENDING``，其余三列都是 ``null``。
+
+    这三个 null 是**事实**（还没人复核过），不是"取不到值" —— 前端据此区分
+    "未复核"与"复核了但没写意见"。
+    """
+    (risk,) = _get(client, scene.task_id)["risks"]
+
+    assert risk["review_status"] == "PENDING"
+    assert risk["reviewer_id"] is None
+    assert risk["review_comment"] is None
+    assert risk["reviewed_at"] is None
+
+
+def test_the_review_fields_do_not_disturb_the_ai_facts(client: TestClient, scene: Scenario) -> None:
+    """新增四列不能把原有的 AI 字段挤掉或改名 —— 前端靠它们渲染风险卡片。"""
+    (risk,) = _get(client, scene.task_id)["risks"]
+
+    assert risk["risk_title"] == "风险标题"
+    assert risk["dimension"] == "知识产权"
+    assert risk["risk_level"] == "HIGH"
+    assert risk["source"] == "RULE"
+    assert risk["reason"] == "成因"
+    assert risk["legal_basis"] == "依据"
+    assert risk["original_text"] == "命中片段"
+    assert risk["paragraph_index"] == 1
+    assert risk["clause_id"] == scene.clause_id
+
+
+# --------------------------------------------------------------------------- #
 # 12：空集合
 # --------------------------------------------------------------------------- #
 def test_empty_collections_are_two_hundred_with_empty_arrays(client: TestClient) -> None:

@@ -15,14 +15,17 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
-from app.core.constants import RiskLevel
+from app.core.constants import RiskLevel, RiskReviewStatus
 from app.services.report_render import (
+    _REVIEW_STATUS_LABELS,
     UNLINKED_CLAUSE_LABEL,
     ReportClause,
     ReportContract,
@@ -37,6 +40,9 @@ from app.services.report_render import (
     render_markdown,
     risk_overview,
 )
+
+#: 仓库根 —— 跨层契约用例要读前端的词表文件
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 #: 审查结论的三个取值 —— 报告里**绝不允许**出现（见模块 docstring）
 FORBIDDEN_CONCLUSION_TOKENS = ("PASS", "RECTIFY", "REJECT")
@@ -72,6 +78,8 @@ def make_risk(**overrides: object) -> ReportRisk:
         clause_id=100,
         locator_type="PARAGRAPH",
         review_status="PENDING",
+        review_comment=None,
+        reviewed_at=None,
     )
     return replace(base, **overrides)  # type: ignore[arg-type]
 
@@ -517,3 +525,172 @@ def test_rendering_the_report_does_not_touch_the_input() -> None:
 
     assert repr(data) == snapshot
     assert isinstance(data.risks, tuple)
+
+
+# --------------------------------------------------------------------------- #
+# 人工复核标注（P13-4）
+# --------------------------------------------------------------------------- #
+def _reviewed(**overrides: object) -> str:
+    return render_markdown(make_data(risks=(make_risk(**overrides),)))  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("status", "label"),
+    [
+        ("PENDING", "待复核"),
+        ("CONFIRMED", "已确认"),
+        ("REJECTED", "已驳回"),
+        ("MODIFIED", "已修改"),
+    ],
+)
+def test_each_review_status_shows_up_in_the_risk_detail(status: str, label: str) -> None:
+    body = _reviewed(review_status=status, risk_level="LOW" if status == "MODIFIED" else "HIGH")
+
+    assert f"| 人工复核 | {label} |" in body
+
+
+def test_an_unknown_review_status_is_shown_raw() -> None:
+    """与阶段、等级同一条规矩：认不出来的原样显示，**不**兜底成"未知"。"""
+    assert "| 人工复核 | SOMETHING_NEW |" in _reviewed(review_status="SOMETHING_NEW")
+
+
+def test_an_unreviewed_risk_has_no_extra_review_lines() -> None:
+    """PENDING 的风险只有"待复核"这一格，没有意见/时间/人工等级三行。
+
+    这既保护了历史数据（P13 之前的风险全是 PENDING + 两个 NULL），
+    也让"已复核"在版面上真的看得出来。
+    """
+    body = _reviewed()
+
+    assert "- **复核意见**" not in body
+    assert "- **复核时间**" not in body
+    assert "- **人工风险等级**" not in body
+
+
+def test_the_review_comment_is_rendered_when_present() -> None:
+    body = _reviewed(review_status="CONFIRMED", review_comment="已与业务确认接受该条款")
+
+    assert "- **复核意见**：已与业务确认接受该条款" in body
+
+
+@pytest.mark.parametrize("empty", [None, "", "   "])
+def test_an_empty_review_comment_produces_no_line(empty: str | None) -> None:
+    """空意见**整行不输出** —— 印一行"复核意见："会被读成"写了但内容是空的"。"""
+    body = _reviewed(review_status="CONFIRMED", review_comment=empty)
+
+    assert "- **复核意见**" not in body
+
+
+def test_the_review_time_is_rendered_in_utc_when_present() -> None:
+    body = _reviewed(review_status="CONFIRMED", reviewed_at=naive_utc(2026, 9, 16, 8, 12))
+
+    assert "- **复核时间**：2026-09-16 08:12 (UTC)" in body
+
+
+def test_a_missing_review_time_produces_no_line() -> None:
+    assert "- **复核时间**" not in _reviewed(review_status="CONFIRMED", reviewed_at=None)
+
+
+def test_the_human_level_appears_only_for_modified() -> None:
+    """``MODIFIED`` 是唯一会改写 ``risk_level`` 的结论。
+
+    那时标题上的 ``[LOW]`` 其实是**人工值**，因此单独列一行讲清来源 ——
+    免得读者把它当成 AI 原来的判断。
+    """
+    assert "- **人工风险等级**：LOW" in _reviewed(review_status="MODIFIED", risk_level="LOW")
+    for status in ("PENDING", "CONFIRMED", "REJECTED"):
+        assert "- **人工风险等级**" not in _reviewed(review_status=status, risk_level="HIGH")
+
+
+@pytest.mark.parametrize("status", ["PENDING", "CONFIRMED", "REJECTED", "MODIFIED"])
+def test_the_report_never_invents_a_reviewer(status: str) -> None:
+    """``reviewer_id`` 恒为 NULL，报告里**不许**出现任何编造的用户。
+
+    报告的数据模型里根本没有 reviewer_id 这一列 —— 想编也编不出来。
+    这条断言防的是"顺手加一行'复核人：系统'"这种改动。
+    """
+    body = _reviewed(review_status=status, review_comment="意见")
+
+    for made_up in ("系统用户", "未知用户", "默认复核人", "当前用户", "**复核人**", "admin"):
+        assert made_up not in body
+
+
+def test_a_reviewed_risk_is_always_counted_by_its_ai_level() -> None:
+    """**风险概览统计的是 AI 发现了什么，不是人工裁决后的结果。**
+
+    被驳回的风险照样计入总数与等级分布 —— 报告开头那个表说的是"这次审查发现了
+    4 条风险"，而不是"4 条里有 1 条被判掉了"。人工结论只出现在风险详情里。
+    """
+    risks = (
+        make_risk(risk_id=1, risk_level="HIGH", review_status="REJECTED"),
+        make_risk(risk_id=2, risk_level="HIGH", review_status="CONFIRMED"),
+        make_risk(risk_id=3, risk_level="MEDIUM", review_status="PENDING"),
+        make_risk(risk_id=4, risk_level="LOW", review_status="MODIFIED"),
+    )
+
+    body = render_markdown(make_data(risks=risks))
+
+    assert "本次审查共发现 4 项风险，其中 HIGH 2 项、MEDIUM 1 项、LOW 1 项。" in body
+    assert "| HIGH | 2 |" in body
+    assert "| MEDIUM | 1 |" in body
+    assert "| LOW | 1 |" in body
+    assert "| 合计 | 4 |" in body
+
+
+def test_the_review_status_vocabulary_matches_the_frontend() -> None:
+    """**跨层契约**：报告的复核状态词表必须与前端逐字相同。
+
+    两套词表分别用 Python 与 TypeScript 写（跨语言没法共用一份），但它们描述的是
+    同一个 ``risk_item.review_status``。一旦漂移，同一条风险会在工作台叫"已驳回"、
+    在报告里叫别的 —— 而**两边谁都不会报错**，只有对比才看得出来。
+
+    这里直接读前端源文件比对：解析失败会给出明确提示，不会静默通过。
+    """
+    frontend_source = _REPO_ROOT / "frontend" / "src" / "constants" / "review.ts"
+    text = frontend_source.read_text(encoding="utf-8")
+
+    block = re.search(r"RISK_REVIEW_STATUS_LABELS[^{]*\{(.*?)\}", text, re.DOTALL)
+    assert block is not None, f"没能在 {frontend_source} 里找到 RISK_REVIEW_STATUS_LABELS"
+
+    frontend_labels = dict(re.findall(r"(\w+):\s*'([^']*)'", block.group(1)))
+    assert frontend_labels, f"解析出的前端词表是空的，检查 {frontend_source} 的写法"
+
+    assert frontend_labels == _REVIEW_STATUS_LABELS
+
+
+def test_the_frontend_decisions_match_the_backend_enum() -> None:
+    """前端**可选**的复核结论必须与后端枚举里"非 PENDING 的那些"完全一致。"""
+    frontend_source = _REPO_ROOT / "frontend" / "src" / "constants" / "review.ts"
+    text = frontend_source.read_text(encoding="utf-8")
+
+    block = re.search(r"RISK_REVIEW_DECISIONS\s*=\s*\[(.*?)\]", text, re.DOTALL)
+    assert block is not None, f"没能在 {frontend_source} 里找到 RISK_REVIEW_DECISIONS"
+
+    decisions = re.findall(r"'([A-Z_]+)'", block.group(1))
+    backend_decisions = [s.value for s in RiskReviewStatus if s is not RiskReviewStatus.PENDING]
+
+    assert decisions == backend_decisions
+    assert "PENDING" not in decisions
+
+
+def test_the_overview_counts_the_current_level_not_a_preserved_original() -> None:
+    """⚠️ **方案 A 的已知后果，不是 P13-4 引入的。**
+
+    ``MODIFIED`` 会把 ``risk_item.risk_level`` **就地改写**（P13-1 裁决接受），
+    原始 AI 等级不留痕。而概览按 ``risk_level`` 统计，因此一条从 HIGH 改成 LOW 的
+    风险，在概览里**算作 LOW**。
+
+    也就是说"概览 = AI 原始分布"这句话，在没有 MODIFIED 时严格成立；
+    一旦有人改过等级，那一行反映的就是人工值。要让概览永远等于 AI 原始分布，
+    必须先把原始等级存下来（新字段/新表 = 迁移），那不在 P13 范围内。
+    这条用例把当前的真实行为钉住，免得日后被当成 bug 反复"修"。
+    """
+    risks = (
+        make_risk(risk_id=1, risk_level="LOW", review_status="MODIFIED"),
+        make_risk(risk_id=2, risk_level="HIGH", review_status="PENDING"),
+    )
+
+    body = render_markdown(make_data(risks=risks))
+
+    assert "| HIGH | 1 |" in body
+    assert "| LOW | 1 |" in body

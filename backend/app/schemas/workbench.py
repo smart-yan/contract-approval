@@ -192,7 +192,23 @@ class WorkbenchRisk(BaseModel):
     )
     clause_id: int | None = Field(default=None, description="命中的条款 ID；纯 LLM 风险可能为空")
     locator_type: str = Field(description="定位方式，取值见 constants.LocatorType")
+
+    # ---------------------------- 人工复核（P13-2）---------------------------- #
+    # 这四个是**人工判断**，与上面的 AI 产出是同一行上的两个来源。工作台要把它们
+    # 一起返回，前端才分得清"AI 说了什么"与"法务怎么看"（P13-3 的复核 UI 依赖它）。
+    # 写入侧在 ``services/risk_review.py``（P13-1）。
     review_status: str = Field(description="人工复核状态，取值见 constants.RiskReviewStatus")
+    reviewer_id: int | None = Field(
+        default=None,
+        description="复核人。⚠️ **当前恒为 null** —— 项目没有 `sys_user` 表，"
+        "也没有登录体系，写入侧刻意不伪造用户 id（见 services/risk_review.py）",
+    )
+    review_comment: str | None = Field(default=None, description="复核意见；未填写时为 null")
+    reviewed_at: datetime | None = Field(
+        default=None,
+        description="复核时刻（**naive UTC**，与 ``created_at`` 同一口径）；"
+        "未经复核时为 null。展示前请按项目既有方式补 ``Z`` 再交给浏览器",
+    )
 
 
 class ReviewTaskWorkbenchResponse(BaseModel):

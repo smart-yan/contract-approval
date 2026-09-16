@@ -169,7 +169,14 @@ class ReportRisk:
     paragraph_index: int | None
     clause_id: int | None
     locator_type: str
+
+    # ------------------------ 人工复核（P13-4） ------------------------ #
+    # ⚠️ 这三列是**人工判断**，与上面的 AI 字段同行不同源。报告只在**风险详情**里
+    # 展示它们 —— 风险概览仍然按 ``risk_level`` 统计（那是 AI 审查发现的分布），
+    # 被驳回的风险**不从计数里扣除**。
     review_status: str
+    review_comment: str | None
+    reviewed_at: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,6 +315,16 @@ _STAGE_LABELS: dict[str, str] = {
     "REVIEWED": "审查完成",
 }
 
+#: ``risk_item.review_status`` → 报告里的中文说明（P13-4）。
+#: 与前端 ``RISK_REVIEW_STATUS_LABELS`` 是同一套词 —— 两边各自维护一份是跨语言的
+#: 必然，但**取值必须一致**，否则同一条风险在工作台叫"已驳回"、在报告里叫别的。
+_REVIEW_STATUS_LABELS: dict[str, str] = {
+    "PENDING": "待复核",
+    "CONFIRMED": "已确认",
+    "REJECTED": "已驳回",
+    "MODIFIED": "已修改",
+}
+
 
 def render_markdown(data: ReportData) -> str:
     """把 :class:`ReportData` 渲染成最终的 Markdown 报告。
@@ -428,7 +445,10 @@ def _risk_block(index: int, risk: ReportRisk, clauses_by_id: Mapping[int, Report
                 ("所属条款", clause_label(risk.clause_id, clauses_by_id)),
                 ("定位方式", _cell(risk.locator_type)),
                 ("原文段落", _paragraph_text(risk.paragraph_index)),
-                ("复核状态", _cell(risk.review_status)),
+                # 人工复核状态只是**附加信息**：它不影响上面任何一行，也不影响
+                # 报告开头的风险概览（那里的计数按 ``risk_level`` 走，被驳回的
+                # 风险照样计入 —— 那个区域表达的是"AI 发现了什么"）
+                ("人工复核", _review_status_text(risk.review_status)),
             ],
         ),
     ]
@@ -444,6 +464,22 @@ def _risk_block(index: int, risk: ReportRisk, clauses_by_id: Mapping[int, Report
         text = _inline(value)
         if text:
             bullets.append(f"- **{label}**：{text}")
+
+    # ---- 人工复核的补充信息（P13-4）----
+    # 「人工风险等级」只在 MODIFIED 时出现：那时库里的 ``risk_level`` 已经被人工
+    # 改写，标题上的 ``[LOW]`` 其实是**人工值**。这一行把它的来源讲清楚，
+    # 免得读者把它当成 AI 原来的判断。
+    # ⚠️ 也就**只有** MODIFIED 时才有这一行 —— 其余状态下等级就是 AI 的，
+    # 再标一次反而会让人以为"AI 等级"和"人工等级"是两回事。
+    if risk.review_status == "MODIFIED":
+        bullets.append(f"- **人工风险等级**：{_cell(risk.risk_level)}")
+
+    comment = _inline(risk.review_comment)
+    if comment:
+        bullets.append(f"- **复核意见**：{comment}")
+
+    if risk.reviewed_at is not None:
+        bullets.append(f"- **复核时间**：{_datetime_text(risk.reviewed_at)}")
 
     # 空行分隔：表格后面**紧跟**列表时，部分 Markdown 解析器会把列表当成表格的
     # 续行而整段吞掉。一个空行就能避免这个歧义。
@@ -542,3 +578,8 @@ def _stage_text(stage: str) -> str:
 
 def _paragraph_text(paragraph_index: int | None) -> str:
     return f"第 {paragraph_index} 段" if paragraph_index is not None else _EMPTY_CELL
+
+
+def _review_status_text(status: str) -> str:
+    """复核状态的中文名；认不出来的**原样返回**（与 ``_stage_text`` 同一条规矩）。"""
+    return _REVIEW_STATUS_LABELS.get(status, status)

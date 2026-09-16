@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * 审查工作台（P11-6 骨架 + P11-7 风险定位）。
+ * 审查工作台（P11-6 骨架 + P11-7 风险定位 + P13-3 人工复核）。
  *
  * 一次请求拿齐渲染所需的全部数据：``GET /api/v1/review-tasks/{taskId}/workbench``。
  * 页面把它分成几块展示：任务 → 合同 → 文件 → 元数据 → 条款 → 风险 → 原文。
@@ -10,15 +10,22 @@
  * 是 P10 冻结的定位坐标，语义定位（quote → 段落）是 Agent 的职责（P9），
  * 在这里重做一遍等于把同一条契约实现两次。
  *
+ * 人工复核（P13-3）：每条风险卡片上写一条复核结论（确认 / 驳回 / 修改等级）。
+ * ``PATCH .../risks/{riskId}`` 成功后**只就地更新那一条**，不重新拉整个工作台 ——
+ * 重拉会把用户在其他卡片上还没保存的输入冲掉，也白白多跑 5 条 SELECT。
+ *
  * ⚠️ 数据**只读**：页面不修改 API 返回的任何对象（不在 risk / block 上挂
- * ``highlighted`` / ``active`` 之类的 UI 状态）。选中状态一律另开 ref 维护。
+ * ``highlighted`` / ``active`` / ``review_status`` 之类的状态）。选中状态、复核草稿、
+ * 保存结果**一律另开 ref 维护**，模板按"本地覆盖优先"读取。
+ * 那份响应是一次快照，被就地改写后就再也说不清"原始数据是什么样"。
  */
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import { ApiError } from '@/api/request'
+import { reviewRiskItem, type RiskReviewRequest, type RiskReviewResult } from '@/api/risk-review'
 import { getReviewTaskWorkbench, type WorkbenchResponse, type WorkbenchRisk } from '@/api/workbench'
-import { taskStageLabel } from '@/constants/review'
+import { RISK_REVIEW_DECISIONS, riskReviewStatusLabel, taskStageLabel } from '@/constants/review'
 import { formatUtcTimestamp } from '@/utils/datetime'
 
 const route = useRoute()
@@ -51,6 +58,201 @@ const locateHint = ref('')
 /** 原文容器：定位用的 DOM 查询**限定在这一块之内**，不扫全文档。 */
 const blocksRef = ref<HTMLElement | null>(null)
 
+// --------------------------------------------------------------------------- //
+// 人工复核（P13-3）—— 全部是**页面自己的状态**，不写回 API 返回的对象
+// --------------------------------------------------------------------------- //
+/** 复核表单的草稿（按 risk_id 索引）。加载后为每条风险初始化一份。 */
+interface ReviewDraft {
+  /** `''` = 还没选。**不会是 `PENDING`** —— 它不是可选的复核结论 */
+  review_status: string
+  review_comment: string
+  /** 人工风险等级的候选值；未选 MODIFIED 时只是原样带着，不参与提交 */
+  risk_level: string
+}
+
+/** 服务端确认过的复核结果（按 risk_id 索引）。保存成功后才有条目。 */
+interface SavedReview {
+  review_status: string
+  review_comment: string | null
+  risk_level: string
+  reviewed_at: string
+  reviewer_id: number | null
+}
+
+const reviewDrafts = ref<Record<number, ReviewDraft>>({})
+const savedReviews = ref<Record<number, SavedReview>>({})
+/** 正在保存的 risk_id。用来禁按钮，防止连点产生重复请求。 */
+const savingRiskIds = ref<number[]>([])
+/** 每条风险最近一次保存失败的原因（成功后清空）。 */
+const reviewErrors = ref<Record<number, string>>({})
+
+/**
+ * 新建一条草稿时的初值。
+ *
+ * ⚠️ 当前状态是 ``PENDING`` 时，**下拉框留空**（``''``）而不是预选 ``PENDING`` ——
+ * 后者不在选项里，预选一个"选不出来的值"只会让用户以为已经选好了。
+ * 已知的三种已复核状态则照原样预选，方便用户直接改（复核过的风险仍可再改）。
+ */
+function draftFrom(risk: WorkbenchRisk): ReviewDraft {
+  return {
+    review_status: risk.review_status === 'PENDING' ? '' : risk.review_status,
+    review_comment: risk.review_comment ?? '',
+    risk_level: risk.risk_level,
+  }
+}
+
+/** 取某条风险的草稿；没有就现建一份（模板因此永远拿得到值）。 */
+function draftOf(risk: WorkbenchRisk): ReviewDraft {
+  return reviewDrafts.value[risk.risk_id] ?? draftFrom(risk)
+}
+
+function setDraft(riskId: number, risk: WorkbenchRisk, patch: Partial<ReviewDraft>): void {
+  reviewDrafts.value = { ...reviewDrafts.value, [riskId]: { ...draftOf(risk), ...patch } }
+}
+
+/** 加载/刷新后重建草稿 —— 服务端数据变了，旧草稿就没有意义了。 */
+function seedReviewDrafts(data: WorkbenchResponse): void {
+  const drafts: Record<number, ReviewDraft> = {}
+  for (const risk of data.risks) {
+    drafts[risk.risk_id] = draftFrom(risk)
+  }
+  reviewDrafts.value = drafts
+  savedReviews.value = {}
+  reviewErrors.value = {}
+}
+
+/** 当前**已保存**的复核结论 —— 卡片头部用它，草稿改动不提前反映到状态标签上。 */
+function savedOf(risk: WorkbenchRisk): SavedReview | null {
+  return savedReviews.value[risk.risk_id] ?? null
+}
+
+function reviewStatusOf(risk: WorkbenchRisk): string {
+  return savedOf(risk)?.review_status ?? risk.review_status
+}
+
+function reviewedAtOf(risk: WorkbenchRisk): string | null {
+  return savedOf(risk)?.reviewed_at ?? risk.reviewed_at
+}
+
+/** 当前**生效**的风险等级：保存过 MODIFIED 之后，库里那一列已经是人工值。 */
+function riskLevelOf(risk: WorkbenchRisk): string {
+  return savedOf(risk)?.risk_level ?? risk.risk_level
+}
+
+function isSaving(risk: WorkbenchRisk): boolean {
+  return savingRiskIds.value.includes(risk.risk_id)
+}
+
+function reviewErrorOf(risk: WorkbenchRisk): string {
+  return reviewErrors.value[risk.risk_id] ?? ''
+}
+
+function reviewStatusTag(status: string): 'success' | 'danger' | 'warning' | 'info' {
+  switch (status) {
+    case 'CONFIRMED':
+      return 'success'
+    case 'REJECTED':
+      return 'danger'
+    case 'MODIFIED':
+      return 'warning'
+    default:
+      return 'info'
+  }
+}
+
+/**
+ * 把复核失败翻译成一句人话。
+ *
+ * ⚠️ **422 单独判 ``status`` 而不是 ``code``**：后端的请求体校验错误走的是
+ * FastAPI 默认处理器，响应体是 ``{"detail": [...]}``，**没有** ``code`` 字段 ——
+ * 拦截器会把它归成 ``NETWORK_ERROR``（见 ``api/request.ts`` 的回退分支）。
+ * 若照 ``code`` 走，用户会看到"网络错误"，而真实原因是"参数不合法"。
+ * 代价是**后端那句精确的校验文案拿不到**（它只存在于 ``detail`` 里）；
+ * 这一层取舍已在 P13-3 报告中记录，等契约统一后再改成直接展示后端文案。
+ */
+function reviewErrorMessage(error: unknown): string {
+  if (!(error instanceof ApiError)) {
+    return '复核失败，请稍后重试'
+  }
+  switch (error.code) {
+    case 'RISK_REVIEW_NOT_READY':
+      return '任务尚未完成风险审查，当前无法复核'
+    case 'RISK_NOT_FOUND':
+      return '这条风险不存在，或不属于当前任务'
+    case 'TASK_NOT_FOUND':
+      return '审查任务不存在'
+    default:
+      break
+  }
+  if (error.status === 422) {
+    return '提交的复核内容不合法（请检查复核结论与风险等级的搭配）'
+  }
+  return error.message
+}
+
+/**
+ * 提交一条复核结论。
+ *
+ * 请求体**只**由草稿里的三个字段拼成 —— AI 事实字段（``risk_title`` / ``reason`` /
+ * ``original_text`` / ``paragraph_index`` …）与服务端字段（``reviewer_id`` /
+ * ``reviewed_at``）一律不发，后端也会拒绝。
+ *
+ * 成功后**不重新拉工作台**，只用返回值更新这一条 —— 重拉会冲掉其他卡片上
+ * 还没保存的输入。
+ */
+async function saveReview(risk: WorkbenchRisk): Promise<void> {
+  const id = taskId.value
+  const draft = draftOf(risk)
+  if (id === null || isSaving(risk)) {
+    return
+  }
+  if (!draft.review_status) {
+    reviewErrors.value = { ...reviewErrors.value, [risk.risk_id]: '请先选择复核结论' }
+    return
+  }
+
+  const payload: RiskReviewRequest = {
+    review_status: draft.review_status,
+    // 显式传 null 表示"清空意见" —— 服务端是整体赋值，省略与 null 等价
+    review_comment: draft.review_comment.trim() === '' ? null : draft.review_comment.trim(),
+  }
+  // ⚠️ 只有 MODIFIED 才能带等级：另两种结论带上它会被后端 422 拒绝
+  if (draft.review_status === 'MODIFIED') {
+    payload.risk_level = draft.risk_level
+  }
+
+  savingRiskIds.value = [...savingRiskIds.value, risk.risk_id]
+  reviewErrors.value = { ...reviewErrors.value, [risk.risk_id]: '' }
+
+  try {
+    const result: RiskReviewResult = await reviewRiskItem(id, risk.risk_id, payload)
+    savedReviews.value = {
+      ...savedReviews.value,
+      [risk.risk_id]: {
+        review_status: result.review_status,
+        review_comment: result.review_comment,
+        risk_level: result.risk_level,
+        reviewed_at: result.reviewed_at,
+        reviewer_id: result.reviewer_id,
+      },
+    }
+    // 草稿与服务端对齐（服务端可能规范化过文本），并让"已保存"成为新的编辑起点
+    reviewDrafts.value = {
+      ...reviewDrafts.value,
+      [risk.risk_id]: {
+        review_status: result.review_status,
+        review_comment: result.review_comment ?? '',
+        risk_level: result.risk_level,
+      },
+    }
+  } catch (error) {
+    // ⚠️ 失败时**保留用户输入**（草稿不动），只记一条提示
+    reviewErrors.value = { ...reviewErrors.value, [risk.risk_id]: reviewErrorMessage(error) }
+  } finally {
+    savingRiskIds.value = savingRiskIds.value.filter((value) => value !== risk.risk_id)
+  }
+}
+
 /**
  * 从路由取 taskId 并做**最小**校验。
  *
@@ -79,6 +281,14 @@ const RISK_LEVEL_TAG: Record<string, 'danger' | 'warning' | 'info'> = {
 function riskLevelTag(level: string): 'danger' | 'warning' | 'info' {
   return RISK_LEVEL_TAG[level] ?? 'info'
 }
+
+/**
+ * 人工可选的风险等级。
+ *
+ * ⚠️ **从上面那张表派生**，不另立一份等级清单：两处各写一遍的话，
+ * 将来加一档等级时总会漏掉一处，而漏掉的那处**不会报错**。
+ */
+const RISK_LEVELS = Object.keys(RISK_LEVEL_TAG)
 
 /** 只取摘要展示，但**不改动原值**（完整值放在 title 里，鼠标悬停可见）。 */
 function shortHash(sha256: string): string {
@@ -144,7 +354,10 @@ async function load(): Promise<void> {
   }
 
   try {
-    workbench.value = await getReviewTaskWorkbench(id)
+    const data = await getReviewTaskWorkbench(id)
+    workbench.value = data
+    // 复核草稿必须跟着新数据重建 —— 否则刷新后会拿着上一份数据的草稿
+    seedReviewDrafts(data)
   } catch (error) {
     workbench.value = null
     if (error instanceof ApiError && error.code === 'TASK_NOT_FOUND') {
@@ -339,13 +552,17 @@ onMounted(load)
               @keydown.space.prevent="handleRiskLocate(risk)"
             >
               <div class="risk__header">
-                <el-tag :type="riskLevelTag(risk.risk_level)" size="small">
-                  {{ risk.risk_level }}
+                <el-tag :type="riskLevelTag(riskLevelOf(risk))" size="small">
+                  {{ riskLevelOf(risk) }}
                 </el-tag>
                 <strong class="risk__title">{{ risk.risk_title }}</strong>
                 <el-tag size="small" type="info">{{ risk.dimension }}</el-tag>
                 <el-tag size="small" type="info">{{ risk.source }}</el-tag>
-                <span class="workbench__muted">{{ risk.review_status }}</span>
+                <el-tag size="small" :type="reviewStatusTag(reviewStatusOf(risk))">
+                  {{ riskReviewStatusLabel(reviewStatusOf(risk)) }}
+                </el-tag>
+                <!-- 原始状态码一并留着：与报告里的「审查完成（REVIEWED）」同一写法 -->
+                <span class="workbench__muted">{{ reviewStatusOf(risk) }}</span>
               </div>
 
               <dl class="risk__fields">
@@ -370,6 +587,88 @@ onMounted(load)
                   </span>
                 </dd>
               </dl>
+
+              <!--
+                ---------- 人工复核（P13-3） ----------
+                ⚠️ @click.stop / @keydown.stop 是**必须**的：整张卡片是"点击定位原文"
+                的 role=button，不拦住冒泡的话，点下拉框会顺带把原文滚走，
+                在意见框里按回车会直接触发定位。
+              -->
+              <div class="review" @click.stop @keydown.stop>
+                <div class="review__head">
+                  <span class="review__label">人工复核</span>
+                  <template v-if="reviewedAtOf(risk)">
+                    <span class="workbench__muted">
+                      复核于 {{ formatUtcTimestamp(reviewedAtOf(risk)) }}
+                    </span>
+                  </template>
+                  <template v-else>
+                    <span class="workbench__muted">尚未复核</span>
+                  </template>
+                </div>
+
+                <div class="review__form">
+                  <el-select
+                    class="review__status"
+                    :model-value="draftOf(risk).review_status"
+                    placeholder="选择复核结论"
+                    size="small"
+                    :disabled="isSaving(risk)"
+                    @update:model-value="(value: unknown) => setDraft(risk.risk_id, risk, { review_status: String(value) })"
+                  >
+                    <!-- 选项来自 RISK_REVIEW_DECISIONS：**没有 PENDING** -->
+                    <el-option
+                      v-for="decision in RISK_REVIEW_DECISIONS"
+                      :key="decision"
+                      :label="riskReviewStatusLabel(decision)"
+                      :value="decision"
+                    />
+                  </el-select>
+
+                  <!-- 人工等级只在 MODIFIED 出现；AI 的等级仍在卡片上方，只读 -->
+                  <el-select
+                    v-if="draftOf(risk).review_status === 'MODIFIED'"
+                    class="review__level"
+                    :model-value="draftOf(risk).risk_level"
+                    placeholder="人工风险等级"
+                    size="small"
+                    :disabled="isSaving(risk)"
+                    @update:model-value="(value: unknown) => setDraft(risk.risk_id, risk, { risk_level: String(value) })"
+                  >
+                    <el-option v-for="level in RISK_LEVELS" :key="level" :label="level" :value="level" />
+                  </el-select>
+
+                  <el-input
+                    class="review__comment"
+                    type="textarea"
+                    :rows="2"
+                    size="small"
+                    placeholder="复核意见（可选）"
+                    :model-value="draftOf(risk).review_comment"
+                    :disabled="isSaving(risk)"
+                    @update:model-value="(value: string) => setDraft(risk.risk_id, risk, { review_comment: value })"
+                  />
+
+                  <el-button
+                    type="primary"
+                    size="small"
+                    :loading="isSaving(risk)"
+                    :disabled="isSaving(risk) || !draftOf(risk).review_status"
+                    @click="saveReview(risk)"
+                  >
+                    保存复核
+                  </el-button>
+                </div>
+
+                <el-alert
+                  v-if="reviewErrorOf(risk)"
+                  class="review__error"
+                  type="error"
+                  :closable="false"
+                  show-icon
+                  :title="reviewErrorOf(risk)"
+                />
+              </div>
             </div>
           </div>
         </el-card>
@@ -461,6 +760,50 @@ onMounted(load)
 
 .risks__hint {
   margin-bottom: 8px;
+}
+
+/* ---------------- 人工复核（P13-3） ---------------- */
+/* 与只读的 AI 事实用一条分隔线隔开：上面是"AI 说了什么"，下面是"法务怎么看"。 */
+.review {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--el-border-color-lighter);
+}
+
+.review__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+  font-size: 13px;
+}
+
+.review__label {
+  color: var(--el-text-color-secondary);
+}
+
+.review__form {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.review__status {
+  width: 140px;
+}
+
+.review__level {
+  width: 120px;
+}
+
+.review__comment {
+  flex: 1 1 220px;
+  min-width: 180px;
+}
+
+.review__error {
+  margin-top: 8px;
 }
 
 .clause__header,

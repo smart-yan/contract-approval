@@ -819,3 +819,156 @@ def test_the_report_renders_the_stored_time_as_utc(client: TestClient, scene: Sc
     assert "(UTC)" in body
     created_at = _query("SELECT created_at FROM review_task WHERE id = %s", (scene.task_id,))[0][0]
     assert created_at.strftime("%Y-%m-%d %H:%M") in body
+
+
+# --------------------------------------------------------------------------- #
+# 12：人工复核标注（P13-4）
+# --------------------------------------------------------------------------- #
+# 端到端：走 **P13-1 的真实 PATCH 接口**写下复核结论，再导出报告 ——
+# 这样"写入侧改了哪些列"与"报告读了哪些列"是在同一条链路上被验证的，
+# 而不是靠测试自己 UPDATE 一个值来假装。
+def _risk_ids(task_id: int) -> list[int]:
+    rows = _query("SELECT id FROM risk_item WHERE task_id = %s ORDER BY id", (task_id,))
+    return [row[0] for row in rows]
+
+
+def _review(client: TestClient, task_id: int, risk_id: int, **body: object):
+    return client.patch(f"/api/v1/review-tasks/{task_id}/risks/{risk_id}", json=body)
+
+
+def _first_risk_id(client: TestClient, scene: Scenario) -> int:
+    ids = _risk_ids(scene.task_id)
+    assert ids, "场景里应当有风险，否则这些断言是空转"
+    return ids[0]
+
+
+def test_a_report_with_unreviewed_risks_still_exports(client: TestClient, scene: Scenario) -> None:
+    """**历史数据兼容**：P13 之前的风险全是 PENDING + 两个 NULL，报告必须照常生成。"""
+    response = _export(client, scene.task_id)
+
+    assert response.status_code == 200
+    assert "| 人工复核 | 待复核 |" in response.text
+    assert "- **复核意见**" not in response.text
+    assert "- **复核时间**" not in response.text
+
+
+def test_the_report_shows_a_confirmed_review(client: TestClient, scene: Scenario) -> None:
+    risk_id = _first_risk_id(client, scene)
+    assert (
+        _review(
+            client,
+            scene.task_id,
+            risk_id,
+            review_status="CONFIRMED",
+            review_comment="已与业务确认，接受该条款",
+        ).status_code
+        == 200
+    )
+
+    body = _export(client, scene.task_id).text
+
+    assert "| 人工复核 | 已确认 |" in body
+    assert "- **复核意见**：已与业务确认，接受该条款" in body
+    assert "- **复核时间**" in body
+    # 人工等级只在 MODIFIED 出现
+    assert "- **人工风险等级**" not in body
+
+
+def test_the_report_shows_a_rejected_review(client: TestClient, scene: Scenario) -> None:
+    risk_id = _first_risk_id(client, scene)
+    _review(client, scene.task_id, risk_id, review_status="REJECTED", review_comment="属于正常业务条款")
+
+    assert "| 人工复核 | 已驳回 |" in _export(client, scene.task_id).text
+
+
+def test_the_report_shows_a_modified_review_with_the_human_level(
+    client: TestClient, scene: Scenario
+) -> None:
+    risk_id = _first_risk_id(client, scene)
+    _review(
+        client,
+        scene.task_id,
+        risk_id,
+        review_status="MODIFIED",
+        risk_level="LOW",
+        review_comment="等级下调",
+    )
+
+    body = _export(client, scene.task_id).text
+
+    assert "| 人工复核 | 已修改 |" in body
+    assert "- **人工风险等级**：LOW" in body
+    assert "- **复核意见**：等级下调" in body
+
+
+def test_a_reviewed_risk_is_still_counted_in_the_overview(client: TestClient, scene: Scenario) -> None:
+    """**概览统计的是 AI 发现了什么。**
+
+    把一条风险驳回，概览的条数与等级分布**一个都不许变** ——
+    否则报告开头那句话就从"发现了什么"变成了"裁决后剩下什么"。
+    """
+    before = _export(client, scene.task_id).text
+    risk_id = _first_risk_id(client, scene)
+    _review(client, scene.task_id, risk_id, review_status="REJECTED")
+    after = _export(client, scene.task_id).text
+
+    overview_before = next(line for line in before.splitlines() if line.startswith("本次审查共发现"))
+    overview_after = next(line for line in after.splitlines() if line.startswith("本次审查共发现"))
+
+    assert overview_before == overview_after
+    assert "| 合计 | 4 |" in after
+
+
+def test_the_report_never_names_a_reviewer(client: TestClient, scene: Scenario) -> None:
+    """``reviewer_id`` 恒为 NULL —— 报告里不许出现任何编造的用户名。"""
+    risk_id = _first_risk_id(client, scene)
+    _review(client, scene.task_id, risk_id, review_status="CONFIRMED", review_comment="同意")
+
+    body = _export(client, scene.task_id).text
+
+    for made_up in ("系统用户", "未知用户", "默认复核人", "当前用户", "复核人："):
+        assert made_up not in body
+
+
+def test_one_tasks_review_does_not_leak_into_another_tasks_report(
+    client: TestClient, scene: Scenario
+) -> None:
+    """同合同两次审查：复核了 A 的风险，B 的报告里那条**仍然是待复核**。"""
+    _review(client, scene.task_id, _first_risk_id(client, scene), review_status="REJECTED")
+    other_risk_id = _risk_ids(scene.other_task_id)[0]
+
+    mine = _export(client, scene.task_id).text
+    theirs = _export(client, scene.other_task_id).text
+
+    assert "| 人工复核 | 已驳回 |" in mine
+    assert "| 人工复核 | 待复核 |" in theirs
+    assert "已驳回" not in theirs
+
+    # 另一条路：复核 B 也不影响 A
+    _review(client, scene.other_task_id, other_risk_id, review_status="CONFIRMED")
+    assert "| 人工复核 | 已驳回 |" in _export(client, scene.task_id).text
+
+
+def test_reviewing_does_not_change_the_task_or_the_error_semantics(
+    client: TestClient, scene: Scenario
+) -> None:
+    """复核不碰 ``review_task`` 的任何字段，也不改变导出接口的门禁语义。"""
+    before = _query(
+        "SELECT current_stage, status, finished_at, risk_level_final, conclusion, summary "
+        "FROM review_task WHERE id = %s",
+        (scene.task_id,),
+    )[0]
+
+    _review(client, scene.task_id, _first_risk_id(client, scene), review_status="CONFIRMED")
+
+    after = _query(
+        "SELECT current_stage, status, finished_at, risk_level_final, conclusion, summary "
+        "FROM review_task WHERE id = %s",
+        (scene.task_id,),
+    )[0]
+    assert after == before == ("REVIEWED", "pending", None, None, None, None)
+
+    # 门禁与 404 语义不变
+    assert _export(client, 99999999).status_code == 404
+    unfinished = _build_scenario(stage="CLAUSED", contract_no="RPT-P134")
+    assert _export(client, unfinished.task_id).status_code == 409

@@ -101,6 +101,10 @@ function sample(overrides: Partial<WorkbenchResponse> = {}): WorkbenchResponse {
         clause_id: 100,
         locator_type: 'PARAGRAPH',
         review_status: 'PENDING',
+        // 未复核：三个复核列都是 null（P13-2 起 DTO 会带上它们）
+        reviewer_id: null,
+        review_comment: null,
+        reviewed_at: null,
       },
     ],
     ...overrides,

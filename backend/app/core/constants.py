@@ -135,7 +135,13 @@ WRITEBACK_STATUS_TRANSITIONS: dict[WritebackStatus, frozenset[WritebackStatus]] 
 
 
 class RiskLevel(StrEnum):
-    """风险等级（§11.2 综合等级 = 所有有效风险中的最高等级，高风险一票定级）。"""
+    """**单条**风险的风险等级（§11.2）。
+
+    ⚠️ 它是 ``risk_item.risk_level`` 的取值，**不是**"综合等级"。
+    综合等级（§11.2 的评分结果，落到 ``review_task.risk_level_final``）归 Agent，
+    当前尚未实现，恒为 ``NULL`` —— Backend **不**根据它算综合结论，
+    也**不**因为人工复核而排除 ``REJECTED`` 重算。详见 ``RiskReviewStatus``。
+    """
 
     HIGH = "HIGH"
     MEDIUM = "MEDIUM"
@@ -143,20 +149,44 @@ class RiskLevel(StrEnum):
 
 
 class ReviewConclusion(StrEnum):
-    """审查结论（§11.2）。"""
+    """审查结论（§11.2）—— **词表已定义，但当前没有任何代码产生它**。
+
+    ⚠️ 它是 §11.2 评分（归 Agent）的产物，落到 ``review_task.conclusion``，
+    该列当前**恒为 `NULL`**：评分器尚未实现，而 Backend 刻意不"顺手"填一个
+    没人负责的结论。
+
+    人工复核（§6.3）**不产生**它 —— 复核不推进任务、不重算综合等级，
+    也不排除 ``REJECTED`` 重新裁决。
+    """
 
     PASS = "PASS"  # 仅 LOW 或无风险 → 可通过
     RECTIFY = "RECTIFY"  # 无 HIGH 但有 MEDIUM → 需整改后签署
-    REJECT = "REJECT"  # 存在任一有效 HIGH → 建议拒绝 / 重大整改
+    REJECT = "REJECT"  # 存在任一 HIGH → 建议拒绝 / 重大整改
 
 
 class RiskReviewStatus(StrEnum):
-    """法务人工复核状态（§6.3）。综合等级基于「有效风险」重算，REJECTED 不计入。"""
+    """法务对**单条风险**的人工复核状态（§6.3）。
+
+    ⚠️ 它不是任务状态，也不产生任何综合结论。四条已冻结的边界：
+
+    * **不推进任务**：``review_task`` 的 ``current_stage`` / ``status`` /
+      ``finished_at`` / ``risk_level_final`` / ``conclusion`` / ``summary``
+      **都不因人工复核而改变**。``REVIEWED`` 的含义始终是"AI 风险的持久化已完成"，
+      不会变成"人工复核完成"（人工复核根本不在流程里 —— 它在 ``persist_result``
+      之后，是 Backend 上的一次普通状态更新）
+    * **不重算综合等级**：§11.2 的评分归 Agent，Backend 当前既不计算它，
+      也**不因为 ``REJECTED`` 而重算**任何综合等级
+    * **不从报告概览中扣除**：报告的风险概览按**当前** ``risk_item.risk_level``
+      统计，``REJECTED`` 的风险**照常计入** —— 那个区域表达的是
+      **AI 审查发现了什么**，不是"人工裁决后剩下什么"
+    * **不留历史**：``MODIFIED`` 就地覆盖 ``risk_item.risk_level``，
+      AI 原始等级**不可恢复**；没有 ``original_risk_level``，也没有复核历史表
+    """
 
     PENDING = "PENDING"  # AI 产出，未复核
     CONFIRMED = "CONFIRMED"  # 法务确认
-    REJECTED = "REJECTED"  # 法务判定误报，不计入综合结论
-    MODIFIED = "MODIFIED"  # 法务调整了等级或建议，以人工等级为准
+    REJECTED = "REJECTED"  # 法务判定误报（⚠️ **不从报告概览中扣除**）
+    MODIFIED = "MODIFIED"  # 法务调整了等级（⚠️ 就地覆盖 risk_level，AI 原值不留痕）
 
 
 class RiskSource(StrEnum):
