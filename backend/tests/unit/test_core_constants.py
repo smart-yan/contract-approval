@@ -109,7 +109,8 @@ def test_remaining_enum_vocabulary_is_intact() -> None:
         "HEADER",
         "FOOTER",
     ]
-    assert len(C.BlockReasonCode) == 10
+    # P14-4 新增第 11 个：AGENT_GRAPH_EXECUTION_FAILED（Agent 后台跑图异常退出）
+    assert len(C.BlockReasonCode) == 11
     assert len(C.TaskStage) == 4
 
 

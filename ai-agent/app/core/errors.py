@@ -56,5 +56,14 @@ class AgentErrorCode(StrEnum):
     #: 这个是"我们自己的产物根本不成立" —— 混在一起排查时分会不清该看哪边。
     DOCUMENT_MAPPING_INVALID = "DOCUMENT_MAPPING_INVALID"
 
+    #: **后台**执行整张图时异常退出（P14-4）。
+    #:
+    #: ⚠️ 它不会出现在 ``ContractReviewState.error_code`` 里 —— 图内节点把失败写进
+    #: State（那套语义没变），本码描述的是"图**之外**炸了"：``ainvoke`` 自己抛异常、
+    #: 或后台任务被取消。两者责任方不同，因此不共用一个码。
+    #: 它会被作为 ``block_reason_code`` 上报给 Backend，值与
+    #: ``backend.constants.BlockReasonCode.AGENT_GRAPH_EXECUTION_FAILED`` 一致。
+    GRAPH_EXECUTION_FAILED = "AGENT_GRAPH_EXECUTION_FAILED"
+
 
 __all__ = ["AgentErrorCode"]

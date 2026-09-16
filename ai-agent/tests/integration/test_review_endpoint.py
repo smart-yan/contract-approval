@@ -1,16 +1,27 @@
-"""``POST /api/agent/review`` 的端到端行为。
+"""``POST /api/agent/review`` 的端到端行为（**P14-4 起是异步启动**）。
 
 只 mock **网络层**（``httpx.MockTransport``），不 mock Graph、不 mock 节点 ——
 multipart 编码、临时文件落盘、State 流转、Conditional Edge 分流、
-状态码与响应投影全部真实执行。
+**后台执行**与失败上报全部真实执行。
 
 Agent 在这一跳上只做传输：文件与元数据原样转发给 Backend，
 所有业务判断（类型/大小/幂等）都由 Backend 完成。
+
+⚠️ P14-4 改变了断言的对象
+----------------------
+端点现在只回 ``202 + task_id``，**响应体里不再有** ``workflow_status`` /
+``parse_result``。因此"图跑成什么样"改为从 Agent **对 Backend 做了什么**观察：
+
+* 成功 → 上传 + 写文档层 + 写风险，**且没有** ``POST .../block``
+* 失败 → 有一次 ``POST .../block``，请求体里带着稳定的 ``block_reason_code``
+
+这比断言一个内部 DTO 更接近跨服务真正可见的契约。
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 from collections.abc import Callable, Coroutine, Iterator
 from contextlib import ExitStack
@@ -27,6 +38,7 @@ from app.core.config import get_settings
 from app.llm.schemas import LLMRequest, LLMResult
 from app.main import app
 from app.rules.schemas import EvaluationFailureReason, RuleEvaluationStatus
+from app.schemas.document import ParseResult
 from app.tools.backend_client import BackendClient
 from tests.factories import docx_bytes
 
@@ -190,8 +202,69 @@ def agent() -> Iterator[Callable[..., TestClient]]:
             asyncio.run(http_client.aclose())
 
 
-def _post(test_client: TestClient, payload: bytes = DOCX_BYTES, contract_type: str = "PURCHASE") -> Any:
-    return test_client.post(
+class _Backend:
+    """假 Backend：记录 Agent 发给它的**每一次**请求与请求体。
+
+    P14-4 起端点只返回 202 + task_id，图在后台跑 —— **响应体里再也没有**
+    ``workflow_status`` / ``parse_result`` 了。于是"图干了什么"只能从
+    **它对 Backend 做了什么**观察：上传、写文档层、写风险、以及失败时写 blocked。
+
+    这其实更接近契约本身：跨服务真正可见的就是这些请求。
+    """
+
+    def __init__(self, *, status_code: int = 201, payload: dict[str, Any] | None = None) -> None:
+        self.requests: list[httpx.Request] = []
+        self.bodies: list[bytes] = []
+        self._status = status_code
+        self._payload = SUCCESS_PAYLOAD if payload is None else payload
+
+    async def handler(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        self.bodies.append(await request.aread())
+        return httpx.Response(self._status, json=self._payload)
+
+    def of(self, suffix: str) -> list[httpx.Request]:
+        """按路径后缀筛出请求（``/document``、``/risks``、``/block`` …）。"""
+        return [request for request in self.requests if request.url.path.endswith(suffix)]
+
+    @property
+    def block_payloads(self) -> list[dict[str, Any]]:
+        """所有 ``POST .../block`` 的请求体 —— 后台失败的**唯一**外部证据。"""
+        return [
+            json.loads(self.bodies[index])
+            for index, request in enumerate(self.requests)
+            if request.url.path.endswith("/block")
+        ]
+
+    def assert_not_blocked(self) -> None:
+        """成功路径的判据：**没有**任何 block 调用。
+
+        端点不再回 ``workflow_status``，所以"这次审查成功了"表现为
+        "图跑到底，没有把任务标成阻塞"。
+        """
+        assert self.block_payloads == [], f"不该有 block 调用，实际：{self.block_payloads}"
+
+
+def _post(
+    test_client: TestClient,
+    payload: bytes = DOCX_BYTES,
+    contract_type: str = "PURCHASE",
+    *,
+    settle: bool = True,
+) -> Any:
+    """POST 一次审查，并**等后台图跑完**才返回（返回的是 202 响应本身）。
+
+    P14-4 起端点立刻返回 202、图在后台执行。要断言"图干了什么"就必须等它跑完。
+
+    ⚠️ 后台任务跑在 **TestClient 自己的事件循环**里，测试进程不能直接 ``await``；
+    这里用 TestClient 暴露的 ``portal``（``BlockingPortal``）把 ``drain()``
+    投递进那个循环执行。``portal`` 不是星标公开 API —— 把它换掉的代价是整套测试
+    改成 async + ``ASGITransport``，对本步来说过重；因此把它**包在这一个函数里**，
+    将来要换只改这里。
+
+    422（启动阶段就没通过）不会启动后台图，因此没有东西可等。
+    """
+    response = test_client.post(
         "/api/agent/review",
         files={
             "file": (
@@ -206,6 +279,9 @@ def _post(test_client: TestClient, payload: bytes = DOCX_BYTES, contract_type: s
             "contract_type": contract_type,
         },
     )
+    if response.status_code == 202 and settle:
+        test_client.portal.call(app.state.background_reviews.drain)
+    return response
 
 
 # --------------------------------------------------------------------------- #
@@ -228,44 +304,31 @@ def test_health_still_reports_service_state(agent: Callable[[Handler], TestClien
 # 合法文件 —— 走完 upload → validate → parse
 # --------------------------------------------------------------------------- #
 def test_valid_file_runs_the_whole_workflow(agent: Callable[[Handler], TestClient]) -> None:
-    requests: list[httpx.Request] = []
-    bodies: list[bytes] = []
+    backend = _Backend()
 
-    async def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        bodies.append(await request.aread())
-        return httpx.Response(201, json=SUCCESS_PAYLOAD)
+    response = _post(agent(backend.handler))
 
-    response = _post(agent(handler))
+    assert response.status_code == 202
+    assert response.json() == {"task_id": 33}, "预上传拿到的 review_task_id 原样返回"
 
-    assert response.status_code == 200
-    body = response.json()
-    assert body["workflow_status"] == "completed"
-
-    # 1) 确实把文件转发给了 Backend 的接入接口
+    # 1) 确实把文件转发给了 Backend 的接入接口（P14-4 后这是**预上传**那一次）
     #    ⚠️ P9-10 起图尾还会调一次风险写入接口，因此断言的是**第一次**调用
+    requests, bodies = backend.requests, backend.bodies
     assert requests[0].method == "POST"
     assert str(requests[0].url) == EXPECTED_UPLOAD_URL
     assert requests[0].headers["content-type"].startswith("multipart/form-data;")
     assert b'name="contract_no"' in bodies[0]
     assert DOCX_BYTES in bodies[0], "文件字节必须原样转发"
 
-    # 2) Backend 返回的标识与幂等信号被透传
-    assert body["contract_id"] == 11
-    assert body["file_id"] == 22
-    assert body["review_task_id"] == 33
-    assert body["sha256"] == "a" * 64
-    assert body["reused"] is False
-    assert body["task_reused"] is False
+    # 2) **图用的就是预上传建出来的那个任务** —— 这是 A 方案成立的证据
+    #    图内的 ``upload_file`` 会再上传一次，sha256 幂等让它命中同一个 task；
+    #    因此后续写入打的是**同一个** task_id（Backend 侧的真实幂等由 P4 保证）
+    assert len(backend.of("/document")) == 1
+    assert backend.of("/document")[0].url.path == "/api/v1/review-tasks/33/document"
+    assert backend.of("/risks")[0].url.path == "/api/v1/review-tasks/33/risks"
 
-    # 3) 解析节点真的解析了 DOCX（P6-1 起不再是桩）
-    assert body["parse_result"]["status"] == "PARSED"
-    assert body["parse_result"]["parser"] == "DocxParser"
-    assert body["parse_result"]["source_file_type"] == "DOCX"
-    assert [p["text"] for p in body["parse_result"]["paragraphs"]] == list(DOCX_PARAGRAPHS)
-    assert body["parse_result"]["text"] == "\n".join(DOCX_PARAGRAPHS)
-    assert body["validation_errors"] == []
-    assert body["error_code"] is None
+    # 3) 图真的跑到底了，而且**没有**把任务标成阻塞
+    backend.assert_not_blocked()
 
 
 # --------------------------------------------------------------------------- #
@@ -274,29 +337,21 @@ def test_valid_file_runs_the_whole_workflow(agent: Callable[[Handler], TestClien
 def test_unparsable_document_is_never_reported_as_completed(
     agent: Callable[[Handler], TestClient],
 ) -> None:
-    """核心不变量：``parse_result.status == "FAILED"`` ⇒ ``workflow_status != "completed"``。
+    """核心不变量：解析失败**绝不能**让任务留在"看起来正常"的中间态。
 
     这份文件上传能过（Backend 认它是 DOCX），但内容不是合法的 ZIP ——
-    解析读不出来。工作流**没有**产出任何可用内容，就不能说它完成了。
+    解析读不出来。工作流**没有**产出任何可用内容，就必须**如实留下阻塞痕迹**。
     """
 
-    async def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(201, json=SUCCESS_PAYLOAD)
+    backend = _Backend()
 
-    response = _post(agent(handler), payload=b"this is not a zip archive at all")
+    response = _post(agent(backend.handler), payload=b"this is not a zip archive at all")
 
-    assert response.status_code == 422, "没产出可用文档就不该是 2xx"
-    body = response.json()
-
-    assert body["parse_result"]["status"] == "FAILED"
-    assert body["workflow_status"] != "completed"
-    assert body["workflow_status"] == "rejected"
-    assert body["error_code"] == "PARSE_FAILED"
-    assert body["parse_result"]["error_code"] == "PARSE_FAILED"
-    assert body["parse_result"]["paragraphs"] == []
-    # 上传本身是成功的 —— 失败发生在解析，不要把它误报成上传问题
-    assert body["contract_id"] == 11
-    assert body["validation_errors"] == []
+    assert response.status_code == 202, "受理与否和「这份能不能审」是两件事"
+    # §6.1 早就规定了「解析不可恢复错误 → blocked」，P14-4 才补上写入口。
+    # 落在中间态没人管，比报错更糟 —— 所以这里断言的是**阻塞痕迹确实存在**。
+    assert backend.block_payloads, "解析失败必须留下阻塞痕迹"
+    assert backend.block_payloads[0]["block_reason_code"] == "FILE_CORRUPTED"
 
 
 def test_purchase_request_fetches_the_rule_set_and_runs_every_rule(
@@ -322,10 +377,9 @@ def test_purchase_request_fetches_the_rule_set_and_runs_every_rule(
         rule_set_requests.append(request)
         return httpx.Response(200, json=RULE_SETS_PURCHASE_PAYLOAD)
 
-    async def contract_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(201, json=SUCCESS_PAYLOAD)
+    backend = _Backend()
 
-    response = _post(agent(contract_handler, rule_sets=rules_handler))
+    response = _post(agent(backend.handler, rule_sets=rules_handler))
 
     # 1) 真的按 contract_type 去 Backend 取了当前启用的规则集
     assert len(rule_set_requests) == 1
@@ -344,11 +398,11 @@ def test_purchase_request_fetches_the_rule_set_and_runs_every_rule(
     assert [e.rule_code for e in failed] == ["PAY_PREPAY_RATIO_001"]
     assert failed[0].failure_reason is EvaluationFailureReason.MISSING_INPUT
 
-    # 4) 这次请求**不是因为缺 snapshot 而被拒绝**
-    assert response.status_code == 200
-    body = response.json()
-    assert body["workflow_status"] == "completed"
-    assert body["error_code"] is None
+    # 4) 图跑到底了：受理 202、写完文档层与风险、**没有**把任务标成阻塞
+    assert response.status_code == 202
+    backend.assert_not_blocked()
+    assert len(backend.of("/document")) == 1
+    assert len(backend.of("/risks")) == 1
 
 
 @pytest.mark.parametrize(
@@ -379,8 +433,7 @@ def test_purchase_request_feeds_metadata_into_the_threshold_rule(
 
     monkeypatch.setattr(_RULE_REVIEW_MODULE, "evaluate_rule", spy)
 
-    async def contract_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(201, json=SUCCESS_PAYLOAD)
+    backend = _Backend()
 
     # 一份带**真实表格**的 DOCX：付款计划表里「1. 预付款 | <比例>」
     payload = docx_bytes(
@@ -389,7 +442,7 @@ def test_purchase_request_feeds_metadata_into_the_threshold_rule(
         [["付款阶段", "比例"], ["1. 预付款", prepay_cell], ["2. 到货款", "60%"]],
     )
 
-    response = _post(agent(contract_handler), payload=payload)
+    response = _post(agent(backend.handler), payload=payload)
 
     threshold = next(e for e in evaluations if e.rule_code == "PAY_PREPAY_RATIO_001")
     assert threshold.status is expected_status
@@ -408,8 +461,8 @@ def test_purchase_request_feeds_metadata_into_the_threshold_rule(
         "IP_OWNER_SUPPLIER_001",
         "LIAB_UNLIMITED_001",
     ]
-    assert response.status_code == 200
-    assert response.json()["workflow_status"] == "completed"
+    assert response.status_code == 202
+    backend.assert_not_blocked()
 
 
 def test_endpoint_injects_the_llm_provider_from_app_state(
@@ -421,17 +474,15 @@ def test_endpoint_injects_the_llm_provider_from_app_state(
     （换了替身就真的走替身，而不是某个藏在别处的默认实现）。
     """
     provider = _FakeProvider()
+    backend = _Backend()
 
-    async def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(201, json=SUCCESS_PAYLOAD)
-
-    test_client = agent(handler)  # 先启动（lifespan 会创建默认 provider）
+    test_client = agent(backend.handler)  # 先启动（lifespan 会创建默认 provider）
     app.state.llm_provider = provider  # 启动后再替换 —— 与 backend_client 同一手法
     response = _post(test_client)
 
     assert len(provider.requests) == 1, "llm_review 用的就是注入进来的这个 provider"
-    assert response.status_code == 200
-    assert response.json()["workflow_status"] == "completed"
+    assert response.status_code == 202
+    backend.assert_not_blocked()
 
 
 def test_endpoint_degrades_to_rule_only_when_llm_is_unavailable(
@@ -445,16 +496,15 @@ def test_endpoint_degrades_to_rule_only_when_llm_is_unavailable(
     if get_settings().llm_configured:
         pytest.skip("本机配置了 DEEPSEEK_*，这条「未配置」用例不适用")
 
-    async def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(201, json=SUCCESS_PAYLOAD)
+    backend = _Backend()
 
-    response = _post(agent(handler))
+    response = _post(agent(backend.handler))
 
-    body = response.json()
-    assert response.status_code == 200, "LLM 挂了不该让整次审查失败"
-    assert body["workflow_status"] == "completed"
-    assert body["error_code"] is None, "降级不占用整次审查的失败通道"
-    assert body["parse_result"]["status"] == "PARSED"
+    assert response.status_code == 202, "LLM 挂了不该让整次审查失败"
+    # 降级不占用失败通道：图照常跑到底，文档层与风险都写进去了，任务**没有**被阻塞
+    backend.assert_not_blocked()
+    assert len(backend.of("/document")) == 1
+    assert len(backend.of("/risks")) == 1
 
 
 def test_contract_type_without_rule_set_still_completes(
@@ -462,19 +512,16 @@ def test_contract_type_without_rule_set_still_completes(
 ) -> None:
     """SERVICE：Backend 明确回答"没有启用的规则集"（200 + rule_set=null）= **正常完成**。"""
 
-    async def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(201, json=SUCCESS_PAYLOAD)
+    backend = _Backend()
 
     response = _post(
-        agent(handler, rule_sets=_json_response(RULE_SETS_SERVICE_PAYLOAD)),
+        agent(backend.handler, rule_sets=_json_response(RULE_SETS_SERVICE_PAYLOAD)),
         contract_type="SERVICE",
     )
 
-    assert response.status_code == 200
-    body = response.json()
-    assert body["workflow_status"] == "completed"
-    assert body["error_code"] is None
-    assert body["parse_result"]["status"] == "PARSED"
+    assert response.status_code == 202
+    backend.assert_not_blocked()
+    assert len(backend.of("/document")) == 1
 
 
 def test_rule_set_fetch_failure_is_not_disguised_as_an_empty_rule_set(
@@ -542,17 +589,13 @@ def test_empty_document_is_completed_not_rejected(
 ) -> None:
     """空文档是**数据问题**（合同本身没内容），解析是成功的，不能说工作流失败。"""
 
-    async def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(201, json=SUCCESS_PAYLOAD)
+    backend = _Backend()
 
-    response = _post(agent(handler), payload=docx_bytes())
+    response = _post(agent(backend.handler), payload=docx_bytes())
 
-    assert response.status_code == 200
-    body = response.json()
-    assert body["workflow_status"] == "completed"
-    assert body["parse_result"]["status"] == "EMPTY"
-    assert body["parse_result"]["text"] == ""
-    assert body["error_code"] is None
+    assert response.status_code == 202
+    backend.assert_not_blocked()
+    assert len(backend.of("/document")) == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -574,7 +617,7 @@ def test_backend_rejection_yields_422_and_no_parse(
     assert body["workflow_status"] == "rejected"
     # 保留 Backend 的稳定错误码
     assert body["error_code"] == "UNSUPPORTED_FORMAT"
-    assert body["validation_errors"]
+    assert body["error_message"], "启动阶段失败时把原因如实带上"
     assert body["parse_result"] is None, "被拦下时不得进入解析阶段"
     assert body["contract_id"] is None
 
@@ -601,7 +644,11 @@ def test_backend_unreachable_yields_422(agent: Callable[[Handler], TestClient]) 
 def test_upload_temp_file_is_removed_after_the_request(
     agent: Callable[[Handler], TestClient], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """无论工作流成败，请求内落盘的临时文件都必须被删除。"""
+    """无论工作流成败，落盘的临时文件都必须被删除。
+
+    ⚠️ P14-4 后它的生命周期**不再跟着 HTTP 请求**，而是跟着**后台协程** ——
+    请求早就返回了，图还在跑。因此"删掉"发生在后台跑完之后（``_post`` 已经等过它）。
+    """
     created: list[Path] = []
     original = review_module._spool_to_temp
 
@@ -617,9 +664,9 @@ def test_upload_temp_file_is_removed_after_the_request(
 
     response = _post(agent(handler))
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert len(created) == 1, "应当恰好落盘一个临时文件"
-    assert not created[0].exists(), "请求结束后临时文件必须被删除"
+    assert not created[0].exists(), "后台跑完后临时文件必须被删除"
 
 
 def test_temp_file_is_also_removed_when_backend_rejects(
@@ -661,3 +708,180 @@ def test_agent_does_not_write_into_the_repo(
 
     # 确认使用的确实是系统临时目录
     assert Path(tempfile.gettempdir()).is_dir()
+
+
+# --------------------------------------------------------------------------- #
+# P14-4：异步启动 / 后台执行 / 失败上报
+# --------------------------------------------------------------------------- #
+class _FakeGraph:
+    """替身图：让"请求到底等没等图"这件事可以被**确定性**地观察到。
+
+    真图在 mock 掉 Backend 之后只要几十毫秒就跑完了，根本来不及观察"请求是否在等"。
+    ``gate`` 把图卡住直到测试放行 —— 于是"POST 立刻返回"与"图还在后台跑"能同时断言。
+
+    ⚠️ 它替换的是 ``app.state.review_graph``（与 provider / backend_client 同一手法），
+    **不改任何节点**。
+    """
+
+    def __init__(self, *, gate: asyncio.Event | None = None, error: Exception | None = None) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self._gate = gate
+        self._error = error
+
+    async def ainvoke(self, state: dict[str, Any], *, context: Any = None) -> dict[str, Any]:
+        self.calls.append(state)
+        if self._gate is not None:
+            await self._gate.wait()
+        if self._error is not None:
+            raise self._error
+        return {
+            "file_valid": True,
+            "error_code": None,
+            "parse_result": ParseResult(
+                status="PARSED", parser="FakeGraph", source_file_type="DOCX"
+            ),
+        }
+
+
+def test_the_request_does_not_wait_for_the_graph(agent: Callable[[Handler], TestClient]) -> None:
+    """**P14-4 的核心**：请求在**图还没跑完**时就返回了 202。
+
+    "没等"的证明是**这个用例能跑完** —— gate 一直不放行，如果请求等待图，
+    POST 会永远挂住、测试超时。这里再补三条即时可观察的证据。
+    """
+    backend = _Backend()
+    gate = asyncio.Event()
+    graph = _FakeGraph(gate=gate)
+
+    test_client = agent(backend.handler)
+    app.state.review_graph = graph
+
+    response = _post(test_client, settle=False)  # 故意不等后台
+
+    assert response.status_code == 202
+    assert response.json() == {"task_id": 33}
+    assert app.state.background_reviews.active_count == 1, "图已经在后台登记并启动"
+    assert app.state.background_reviews.active_names() == ["review:33"]
+
+    # 放行并等它跑完，别把任务留给后面的用例
+    gate.set()
+    test_client.portal.call(app.state.background_reviews.drain)
+
+    assert len(graph.calls) == 1, "图最终跑了一次"
+    assert app.state.background_reviews.active_count == 0, "跑完必须从登记处消失"
+
+
+def test_the_background_run_is_registered_and_then_cleaned_up(
+    agent: Callable[[Handler], TestClient],
+) -> None:
+    """"active task 被记录 → 完成后被清理"这条生命周期在**真实端点**上也成立。
+
+    登记处的单元测试覆盖了各种边界；这里只确认端点确实把它用起来了。
+    """
+    backend = _Backend()
+    test_client = agent(backend.handler)
+
+    _post(test_client)  # 内部已经 drain
+
+    assert app.state.background_reviews.active_count == 0
+
+
+def test_a_graph_exception_blocks_the_task(agent: Callable[[Handler], TestClient]) -> None:
+    """**§七 的核心**：后台图抛异常必须留下痕迹，绝不能静默消失。
+
+    异常发生在**图之外**（``ainvoke`` 自己炸了），因此它的错误码与图内的
+    ``error_code`` 分开 —— 排查时看的地方不同。
+    """
+    backend = _Backend()
+    test_client = agent(backend.handler)
+    app.state.review_graph = _FakeGraph(error=RuntimeError("图炸了"))
+
+    response = _post(test_client)
+
+    assert response.status_code == 202, "受理过了 —— 失败只能写进任务状态"
+    assert backend.block_payloads, "后台异常必须上报为阻塞"
+    payload = backend.block_payloads[0]
+    assert payload["block_reason_code"] == "AGENT_GRAPH_EXECUTION_FAILED"
+    assert "RuntimeError" in payload["block_reason_msg"], "异常类型要进人话原因"
+
+
+def test_a_background_failure_does_not_leak_a_traceback_to_the_caller(
+    agent: Callable[[Handler], TestClient],
+) -> None:
+    """``block_reason_msg`` 会回到调用方与界面 —— **不许把堆栈塞进去**。"""
+    backend = _Backend()
+    test_client = agent(backend.handler)
+    app.state.review_graph = _FakeGraph(error=RuntimeError("内部细节不应外泄"))
+
+    _post(test_client)
+
+    message = backend.block_payloads[0]["block_reason_msg"]
+    assert "Traceback" not in message
+    assert "File \"" not in message, "不要带堆栈帧"
+
+
+class _IdempotentBackend(_Backend):
+    """第一次上传是"新建"，第二次起是"复用" —— 与真实 Backend 的 P4 行为一致。
+
+    ⚠️ 真正的"不建第二个任务"是 **Backend** 的保证（``sha256`` UNIQUE +
+    ``idempotency_key``），由 P4 的测试与真实 E2E 覆盖。这里钉的是 **Agent 的接线**：
+    它返回自己预上传拿到的那个 id，后续写入也打在同一个 task 上。
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.upload_count = 0
+
+    async def handler(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/contracts"):
+            self.upload_count += 1
+            self.requests.append(request)
+            self.bodies.append(await request.aread())
+            return httpx.Response(
+                200 if self.upload_count > 1 else 201,
+                json={**SUCCESS_PAYLOAD, "reused": self.upload_count > 1, "task_reused": self.upload_count > 1},
+            )
+        return await super().handler(request)
+
+
+def test_the_pre_upload_and_the_graph_land_on_the_same_task(
+    agent: Callable[[Handler], TestClient],
+) -> None:
+    """**A 方案的核心契约**：预上传建出来的 task，就是图后面用的那个 task。
+
+    有两次 ``POST /contracts``：端点自己那次（预上传）与图内 ``upload_file`` 那次。
+    第二次在真实 Backend 上会命中 sha256 幂等、返回**同一个** ``review_task_id`` ——
+    假 Backend 在这里照实模拟。于是可以断言：202 给出的 id 与图后续写入的路径
+    **指向同一个任务**。
+    """
+    backend = _IdempotentBackend()
+    test_client = agent(backend.handler)
+
+    response = _post(test_client)
+
+    assert response.status_code == 202
+    assert response.json() == {"task_id": 33}, "返回的是自己预上传拿到的那个 id"
+
+    assert backend.upload_count == 2, "预上传一次、图内 upload_file 再一次"
+    # 图后续所有写入都打在**同一个** task 上 —— 没有第二个任务
+    assert backend.of("/document")[0].url.path == "/api/v1/review-tasks/33/document"
+    assert backend.of("/risks")[0].url.path == "/api/v1/review-tasks/33/risks"
+
+
+def test_a_pre_upload_without_a_task_id_is_refused(
+    agent: Callable[[Handler], TestClient],
+) -> None:
+    """预上传 2xx 但响应里没有 ``review_task_id`` → **启动阶段拒绝**，不启动后台图。
+
+    这种响应下 Agent 拿不到 task_id，硬跑下去等于"图在跑、外面不知道它在跑哪个任务"。
+    """
+    backend = _Backend(payload={k: v for k, v in SUCCESS_PAYLOAD.items() if k != "review_task_id"})
+    test_client = agent(backend.handler)
+
+    response = _post(test_client)
+
+    assert response.status_code == 422
+    body = response.json()
+    assert body["workflow_status"] == "rejected"
+    assert body["error_code"] == "BACKEND_CONTRACT_INCOMPLETE"
+    assert app.state.background_reviews.active_count == 0, "没拿到 task_id 就不该启动后台图"

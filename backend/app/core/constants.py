@@ -91,6 +91,12 @@ class BlockReasonCode(StrEnum):
     LLM_SCHEMA_INVALID = "LLM_SCHEMA_INVALID"  # 模型输出始终无法通过结构校验
     TIMEOUT = "TIMEOUT"  # 任务超时
     INTERNAL_ERROR = "INTERNAL_ERROR"  # 其它内部错误
+    #: Agent 在**后台**执行整张图时异常退出（P14-4）。
+    #: ⚠️ 与 ``INTERNAL_ERROR`` 分开：那个是 Backend 自己的内部错误，
+    #: 这个的责任方在 Agent（后台任务崩了，Backend 侧只是被通知）。
+    #: 混在一起排查时分不清该看哪边的日志 —— 与 ``DOCUMENT_MAPPING_INVALID``
+    #: 区分 ``BACKEND_REJECTED`` 是同一条理由。
+    AGENT_GRAPH_EXECUTION_FAILED = "AGENT_GRAPH_EXECUTION_FAILED"
 
 
 class ParseStatus(StrEnum):

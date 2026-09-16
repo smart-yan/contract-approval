@@ -44,7 +44,7 @@ import pymysql
 import pytest
 from fastapi.testclient import TestClient
 
-from app.core.errors import AgentErrorCode
+from app.parsers import parse_document_file
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SAMPLE = REPO_ROOT / "samples" / "采购合同-风险版.docx"
@@ -52,6 +52,7 @@ BACKEND_DIR = REPO_ROOT / "backend"
 
 CONTRACT_NO = "E2E-GOLDEN-001"
 PREFIX = "E2E-GOLDEN-"
+
 
 #: 黄金样例在 seed 规则下应当命中的位置（与 ``test_golden_sample_rule_evaluation`` 同源）
 EXPECTED_RULE_HITS = {
@@ -248,9 +249,21 @@ def _cleanup() -> Iterator[None]:
     _purge()
 
 
-def _post_review(client: TestClient, *, contract_no: str = CONTRACT_NO):
+def _post_review(client: TestClient, *, contract_no: str = CONTRACT_NO) -> dict[str, Any]:
+    """跑一次审查（**等后台图跑完**），返回这次运行的**可观察事实**。
+
+    ⚠️ P14-4 起端点只回 ``202 + task_id``，图在后台执行。原先从响应体里取的字段
+    一律改为**从库里读** —— 对这个文件来说这更贴近本意：它测的就是
+    "东西真的落进 MySQL 了"。返回的字典刻意与旧响应**同名同形**，
+    让各处断言只需换掉取值方式，不必逐条重写。
+
+    刻意**不含** ``reused`` / ``task_reused`` / ``validation_errors``：
+    前两个是 Backend 接入响应里的字段，Agent 现在不透传；第三个在"图跑到底且
+    没被阻塞"时必然为空。这三条语义由本文件的**数据库级断言**（"第二遍不多一行"）
+    覆盖，不靠响应体。
+    """
     with SAMPLE.open("rb") as handle:
-        return client.post(
+        response = client.post(
             "/api/agent/review",
             files={
                 "file": (
@@ -266,21 +279,64 @@ def _post_review(client: TestClient, *, contract_no: str = CONTRACT_NO):
             },
         )
 
+    assert response.status_code == 202, response.text
+    task_id = response.json()["task_id"]
+    # ⚠️ 与本文件其它地方一样**延迟 import** ``app``：``agent_client`` 是先设
+    # ``BACKEND_BASE_URL`` 再 import 的，模块级 import 会让应用带着错误的 base_url 建起来
+    from app.main import app
+
+    # 后台任务跑在 TestClient 自己的事件循环里，用它的 portal 把 drain 投递进去
+    client.portal.call(app.state.background_reviews.drain)
+
+    row = _query(
+        "SELECT t.contract_id, t.file_id, t.status, t.current_stage, t.block_reason_code, "
+        "       f.sha256, f.parse_status "
+        "FROM review_task t JOIN contract_file f ON t.file_id = f.id WHERE t.id = %s",
+        (task_id,),
+    )[0]
+    contract_id, file_id, status, _stage, block_code, sha256, parse_status = row
+
+    # ``parse_result`` 的**内容**取本地重新解析的结果 —— 它才是"期望值"那一侧。
+    # 若改成从 ``document_block`` 反读，那些"块必须与解析结果一致"的断言会变成
+    # **自己和自己比**，整条用例就白测了。
+    parsed = parse_document_file(SAMPLE, file_type="DOCX")
+    paragraphs = [
+        {"index": item.index, "text": item.text, "block_type": item.block_type}
+        for item in parsed.paragraphs
+    ]
+
+    return {
+        "review_task_id": task_id,
+        "contract_id": contract_id,
+        "file_id": file_id,
+        "sha256": sha256,
+        "parse_result": {
+            # ⚠️ status 取自 ``contract_file.parse_status``（P10 落库口径：
+            # PARSED/EMPTY 都写 PARSED，FAILED 写 FAILED）—— 这是**实际**结果，
+            # 而 text/paragraphs 是**期望**结果，两者分开才不会自证自明
+            "status": parse_status,
+            "text": parsed.text,
+            "paragraphs": paragraphs,
+        },
+        # "这次审查成功了吗"在 P14-4 之后的判据：**跑到底且没被阻塞**
+        "workflow_status": "rejected" if status == "blocked" else "completed",
+        "error_code": block_code,
+    }
+
 
 # --------------------------------------------------------------------------- #
 # 1：Agent 真实响应
 # --------------------------------------------------------------------------- #
 def test_the_agent_runs_the_whole_chain_over_real_http(agent_client: TestClient) -> None:
-    response = _post_review(agent_client)
+    body = _post_review(agent_client)
 
-    assert response.status_code == 200, response.text
-    body = response.json()
+    # P14-4 起请求只回 202；"这次审查成功了吗"看的是**库里的事实**：
+    # 图跑到底（阶段推进到 REVIEWED）且任务没有被标成阻塞
+    assert body["review_task_id"], "预上传建出了任务"
+    assert body["contract_id"] and body["file_id"]
     assert body["workflow_status"] == "completed"
-    assert body["error_code"] is None
-    assert body["validation_errors"] == []
-    assert body["contract_id"] and body["file_id"] and body["review_task_id"]
+    assert body["error_code"] is None, "成功路径不该留下阻塞原因"
     assert body["sha256"] == hashlib.sha256(SAMPLE.read_bytes()).hexdigest()
-    assert body["reused"] is False and body["task_reused"] is False
     assert body["parse_result"]["status"] == "PARSED"
     assert body["parse_result"]["paragraphs"], "真实文档必须解析出段落"
 
@@ -291,7 +347,7 @@ def test_the_agent_response_carries_no_risks_by_design(agent_client: TestClient)
     这条用例把"设计如此"钉住：哪天有人为了前端方便往响应里塞 risks，
     就等于给同一个事实造出第二个真相源（P10 的裁决明确否掉了那条路）。
     """
-    body = _post_review(agent_client).json()
+    body = _post_review(agent_client)
 
     assert "risks" not in body
     assert "llm_findings" not in body
@@ -301,7 +357,7 @@ def test_the_agent_response_carries_no_risks_by_design(agent_client: TestClient)
 # 2：Contract / ContractFile / ReviewTask
 # --------------------------------------------------------------------------- #
 def test_the_three_records_are_linked_correctly(agent_client: TestClient) -> None:
-    body = _post_review(agent_client).json()
+    body = _post_review(agent_client)
 
     contract = _query(
         "SELECT id, contract_no, contract_type, status FROM contract WHERE id = %s",
@@ -338,7 +394,7 @@ def test_the_three_records_are_linked_correctly(agent_client: TestClient) -> Non
 # 3：DocumentBlock —— 坐标必须真的能切回原文
 # --------------------------------------------------------------------------- #
 def test_every_block_matches_the_agent_parse_result(agent_client: TestClient) -> None:
-    body = _post_review(agent_client).json()
+    body = _post_review(agent_client)
     paragraphs = body["parse_result"]["paragraphs"]
     full_text = body["parse_result"]["text"]
 
@@ -363,7 +419,7 @@ def test_every_block_matches_the_agent_parse_result(agent_client: TestClient) ->
 
 def test_the_rule_hits_land_on_the_expected_paragraphs(agent_client: TestClient) -> None:
     """Golden Sample 的 `段 23 / 段 30` 在**库里**确实是那两句风险原文。"""
-    body = _post_review(agent_client).json()
+    body = _post_review(agent_client)
 
     for paragraph_index, expected_quote in ((23, "知识产权归乙方"), (30, "全部损失")):
         text = _scalar(
@@ -380,7 +436,7 @@ def test_the_rule_hits_land_on_the_expected_paragraphs(agent_client: TestClient)
 def test_clauses_match_the_agent_result_and_point_at_real_blocks(
     agent_client: TestClient,
 ) -> None:
-    body = _post_review(agent_client).json()
+    body = _post_review(agent_client)
     task_id = body["review_task_id"]
 
     rows = _query(
@@ -405,7 +461,7 @@ def test_clauses_match_the_agent_result_and_point_at_real_blocks(
 
 def test_the_clause_count_matches_the_agent_state(agent_client: TestClient) -> None:
     """条款数量与 Agent 侧切分出来的一致（不重不漏）。"""
-    body = _post_review(agent_client).json()
+    body = _post_review(agent_client)
     task_id = body["review_task_id"]
 
     stored = _scalar("SELECT COUNT(*) FROM clause WHERE task_id = %s", (task_id,))
@@ -422,7 +478,7 @@ def test_the_clause_count_matches_the_agent_state(agent_client: TestClient) -> N
 # 5：ContractMetadata
 # --------------------------------------------------------------------------- #
 def test_metadata_is_persisted_with_a_real_source_block(agent_client: TestClient) -> None:
-    body = _post_review(agent_client).json()
+    body = _post_review(agent_client)
 
     rows = _query(
         "SELECT m.field_key, m.field_label, m.field_value, m.value_type, m.extract_method, "
@@ -463,7 +519,7 @@ def test_risks_are_persisted_and_their_clause_really_covers_them(
 
     并验证 ``clause_id`` 指的就是那个条款、它的 ``start/end`` 真的覆盖这个段落。
     """
-    body = _post_review(agent_client).json()
+    body = _post_review(agent_client)
     task_id = body["review_task_id"]
 
     risks = _query(
@@ -529,7 +585,7 @@ def test_the_two_expected_rules_are_hits_with_the_right_clause_type(
     agent_client: TestClient,
 ) -> None:
     """两条规则风险都必须**真实命中**，且各自挂到对应类型的条款上。"""
-    body = _post_review(agent_client).json()
+    body = _post_review(agent_client)
 
     rows = _query(
         "SELECT r.risk_code, r.risk_level, r.paragraph_index, c.clause_type "
@@ -549,7 +605,7 @@ def test_the_two_expected_rules_are_hits_with_the_right_clause_type(
 
 def test_the_risk_evidence_points_back_into_the_document(agent_client: TestClient) -> None:
     """``original_text`` 是命中片段、且能在同一段落里找到（人工核对的依据）。"""
-    body = _post_review(agent_client).json()
+    body = _post_review(agent_client)
 
     rows = _query(
         "SELECT r.original_text, r.paragraph_index FROM risk_item r WHERE r.task_id = %s",
@@ -574,7 +630,7 @@ def test_the_document_layer_is_written_before_the_risks(agent_client: TestClient
 
     这里同时确认门禁**没有**破坏正常路径：``UPLOADED → CLAUSED → REVIEWED`` 一路走通。
     """
-    body = _post_review(agent_client).json()
+    body = _post_review(agent_client)
     task_id = body["review_task_id"]
 
     assert _scalar("SELECT COUNT(*) FROM document_block WHERE contract_id = %s", (body["contract_id"],)) > 0
@@ -593,7 +649,7 @@ def test_a_second_run_does_not_duplicate_anything(agent_client: TestClient) -> N
     这是**既有幂等设计的正常结果**，不是缺陷。这里断言的是"被拒绝"以及
     "第一遍的数据一个字节都没变"。
     """
-    first = _post_review(agent_client).json()
+    first = _post_review(agent_client)
     task_id = first["review_task_id"]
     snapshot = {
         "blocks": _query(
@@ -613,19 +669,17 @@ def test_a_second_run_does_not_duplicate_anything(agent_client: TestClient) -> N
     }
 
     second = _post_review(agent_client)
-    body = second.json()
 
-    assert second.status_code == 422, "第二遍是被拒绝的（409 由 Backend 判定，Agent 报 rejected）"
-    assert body["workflow_status"] == "rejected"
-    assert body["error_code"] in {
-        "DOCUMENT_ALREADY_PERSISTED",
-        AgentErrorCode.BACKEND_REJECTED.value,
-        "TASK_ALREADY_PERSISTED",
-    }
-    # 复用语义照旧：文件和任务都命中了幂等键
-    assert body["contract_id"] == first["contract_id"]
-    assert body["file_id"] == first["file_id"]
-    assert body["review_task_id"] == task_id
+    # ⚠️ P14-4 起"第二遍"的语义变了：请求照样被**受理**（202）—— 预上传是幂等的，
+    # 会命中同一个任务；图随后在文档层撞上 Backend 的 409，被如实记为
+    # ``DOCUMENT_ALREADY_PERSISTED``。那是「这件事此前已经做完了」，
+    # **不是失败**，所以任务**不许**被标成阻塞（否则一次成功的审查会被误报成失败）。
+    assert second["workflow_status"] == "completed", "重复提交不该把已完成的任务打成 blocked"
+    assert second["error_code"] is None, "没有被阻塞，也就不该有阻塞原因"
+    # 复用语义照旧：文件和任务都命中了幂等键 —— 同一个任务，不是新任务
+    assert second["contract_id"] == first["contract_id"]
+    assert second["file_id"] == first["file_id"]
+    assert second["review_task_id"] == task_id
 
     after = {
         "blocks": _query(
@@ -673,7 +727,7 @@ def golden_run(agent_client: TestClient) -> dict[str, Any]:
     这个 fixture 则给需要跨表交叉验证的用例用。
     """
     _purge()
-    body = _post_review(agent_client).json()
+    body = _post_review(agent_client)
     task_id = body["review_task_id"]
     return {
         "response": body,

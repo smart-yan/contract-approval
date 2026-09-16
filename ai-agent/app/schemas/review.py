@@ -52,4 +52,27 @@ class ReviewRunResponse(BaseModel):
     error_message: str | None = Field(default=None, description="人话原因")
 
 
-__all__ = ["ReviewRunResponse"]
+class ReviewAcceptedResponse(BaseModel):
+    """`POST /api/agent/review` 的 **202 响应**（P14-4）。
+
+    为什么只有一个字段
+    ----------------
+    因为在这个时刻，**别的都还不知道**：图还没开始跑，没有 ``workflow_status``、
+    没有 ``parse_result``、没有风险。任何"预计耗时""队列位置""进度"都只能是编的。
+
+    调用方拿 ``task_id`` 去 Backend 查真实状态 —— 那是任务的**事实来源**
+    （``GET /api/v1/review-tasks/{id}/workbench``）。
+
+    ⚠️ 刻意**不含** ``status`` / ``progress`` / ``polling_url`` / ``estimated_time``：
+    这些要么与 Backend 的字段重复（两处口径迟早漂移），要么是猜的。
+    它们属于 P14-5 之后再看的事。
+
+    ⚠️ ``task_id`` 是**预上传**时由 Backend 创建的、**真实的** ReviewTask id，
+    不是 Agent 自己编的关联号 —— 后台图跑起来后 ``upload_file`` 会因
+    ``sha256`` 幂等命中同一个任务，不会另建一个（见 P14-4 的幂等验证）。
+    """
+
+    task_id: int = Field(description="Backend 的 ReviewTask ID —— 用它去查进度与结果")
+
+
+__all__ = ["ReviewAcceptedResponse", "ReviewRunResponse"]

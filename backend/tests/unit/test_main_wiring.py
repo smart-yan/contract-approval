@@ -100,6 +100,8 @@ def test_only_approved_business_routes_are_mounted(app: FastAPI) -> None:
     * P13-1 ``/api/v1/review-tasks/{task_id}/risks/{risk_id}`` —— 人工复核
       （PATCH 一条已复核结论。⚠️ 它与上面的 ``.../risks`` 是**两个不同的路径**，
       不是同一个路径上的新方法 —— 白名单按路径比较，因此必须单独列出）
+    * P14-4 ``/api/v1/review-tasks/{task_id}/block`` —— 任务阻塞写入
+      （Agent 后台执行失败时如实上报；**只写 status 与 block_reason_\\***）
     """
     approved = {
         "/api/v1/contracts",
@@ -109,6 +111,7 @@ def test_only_approved_business_routes_are_mounted(app: FastAPI) -> None:
         "/api/v1/review-tasks/{task_id}/workbench",
         "/api/v1/review-tasks/{task_id}/report/export",
         "/api/v1/review-tasks/{task_id}/risks/{risk_id}",
+        "/api/v1/review-tasks/{task_id}/block",
     }
 
     paths = set(app.openapi()["paths"])

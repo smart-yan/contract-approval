@@ -27,6 +27,7 @@ from fastapi import FastAPI, Request, Response
 from pydantic import BaseModel, Field
 
 from app.api import review_router
+from app.background import BackgroundReviews
 from app.core.config import get_settings
 from app.graph.builder import build_review_graph
 from app.llm.provider import DeepSeekProvider
@@ -66,9 +67,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 于是图里的 ``llm_review`` 会走**降级**分支而不是报错。
     app.state.llm_provider = DeepSeekProvider(settings)
     app.state.review_graph = build_review_graph()
+    # 后台审查的登记处（P14-4）：POST /review 返回 202 之后，图在这个进程里跑。
+    # 它同时负责并发闸门与 shutdown 收尾 —— 见 app/background.py 的说明。
+    app.state.background_reviews = BackgroundReviews()
 
     logger.info("AI Agent 服务启动中 | %s", settings.safe_summary())
     yield
+
+    # ⚠️ 顺序要紧：**先等在跑的后台审查收尾**，再关连接池。
+    # 反过来的话，还在跑的图会在"连接池已关闭"的客户端上发请求，
+    # 抛出的是一个与真实原因无关的异常（`Cannot send a request, as the client
+    # has been closed`），排查时完全看不出"其实是服务在关闭"。
+    await app.state.background_reviews.drain()
 
     # 只关闭自己创建的资源；图是纯内存对象，无需释放
     await app.state.backend_client.aclose()

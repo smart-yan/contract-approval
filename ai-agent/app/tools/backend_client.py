@@ -465,6 +465,70 @@ class BackendClient:
             error_message=error_message,
         )
 
+    # ------------------------------ 任务阻塞 ------------------------------ #
+    async def block_review_task(
+        self,
+        task_id: int,
+        *,
+        reason_code: str,
+        reason_msg: str,
+    ) -> PersistOutcome:
+        """调用 ``POST /api/v1/review-tasks/{task_id}/block`` 如实上报"这次跑挂了"（P14-4）。
+
+        这是 P14-4 之后**唯一**由 Agent 主动写任务状态的通道：图放到后台跑，
+        HTTP 请求早已返回，失败时没有人能再"顺手"返回一个错误 —— 只能走这里。
+
+        .. warning::
+
+           它是**失败路径上的调用**，因此本方法必须比正常路径更不容易把信息弄丢：
+
+           * 连不上 / 超时 → ``BACKEND_UNREACHABLE``（调用方据此知道"连上报都没成功"）
+           * 409（任务已阻塞或已完成）→ 原样带回 Backend 的错误码 —— 这不是 bug，
+             而是"别人已经处理过这个任务了"，调用方**记日志即可，不要重试**
+           * 绝不抛异常：调用点已经在处理另一个异常了，这里再抛会把它盖掉
+
+        :return: 与其它写入方法共用 :class:`PersistOutcome` —— 形状完全一样
+            （状态码 / 响应体 / 错误码），不为一个调用再定义一个数据类
+        """
+        client = self._ensure_client()
+
+        try:
+            response = await client.post(
+                f"{self._api_base}/review-tasks/{task_id}/block",
+                json={"block_reason_code": reason_code, "block_reason_msg": reason_msg},
+                timeout=self._timeout,
+            )
+        except httpx.HTTPError as exc:
+            return PersistOutcome(
+                ok=False,
+                status_code=None,
+                payload=None,
+                error_code=AgentErrorCode.BACKEND_UNREACHABLE.value,
+                error_message=f"调用 Backend 标记任务阻塞失败：{exc}",
+            )
+
+        if response.status_code in _SUCCESS_STATUS:
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = None
+            return PersistOutcome(
+                ok=True,
+                status_code=response.status_code,
+                payload=payload if isinstance(payload, dict) else None,
+                error_code=None,
+                error_message=None,
+            )
+
+        error_code, error_message = _extract_error(response)
+        return PersistOutcome(
+            ok=False,
+            status_code=response.status_code,
+            payload=None,
+            error_code=error_code,
+            error_message=error_message,
+        )
+
 
 __all__ = [
     "API_V1_PREFIX",
