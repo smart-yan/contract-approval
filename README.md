@@ -37,15 +37,21 @@
 | P16-1 | 异常 / 错误 / 重试 / 集成 Demo 现状侦察（只读审计：49 个 `ErrorCode` 矩阵、Retry 矩阵、P14→P15 集成链路、6 个 Demo 场景、测试隔离、Mock Approval 复现性） | ✅ COMPLETE |
 | P16-2 | Frontend Workbench 审批回写入口（`frontend/src/api/writeback.ts` + `WorkbenchView.vue`「回写审批意见」操作；SUCCESS / FAILED / 409 `WRITEBACK_ALREADY_SUCCESS` 三态；17 个 frontend writeback 测试） | ✅ PASS / FROZEN |
 | P16-3 | 异常路径演示工具与文档（`backend/scripts/demo_writeback_failures.py` 6 个场景 + `docs/16-异常路径演示.md` 索引；**0** 产品代码修改） | ✅ PASS / FROZEN |
-| P16-4 | 文档一致性同步（`README.md` + `docs/01-架构设计.md` 与真实代码 / 测试对齐） | ⏳ 当前实施中 |
+| P16-4 | 文档一致性同步（`README.md` + `docs/01-架构设计.md` 与真实代码 / 测试对齐） | ✅ PASS / FROZEN |
+| P17-1 | 最终项目只读侦察（Git / API / 边界 / Migration / 测试 / Golden Path / Error-Retry 全方位审计；2139 passed + 1 skipped 验证） | ✅ COMPLETE / FROZEN |
+| P17-2 | 最终文档冻结（`README.md` 测试口径统一 + `docs/PROJECT_FINAL.md` 项目终态报告） | ⏳ 当前实施中 |
 
-> **当前状态**：P4 ~ P15 阶段性冻结（`backend/tests/integration/` / `backend/app/api/v1/endpoints/` / `backend/app/services/` / `ai-agent/app/api/review.py` / `frontend/src/views/workbench/WorkbenchView.vue` 与对应测试均已 PASS）；P16-1 / P16-2 / P16-3 已完成；P16-4 当前正在做文档同步收尾。
+> **当前状态**：P14 / P15 / P16 已整体 commit + push（commit `7846ed3a3bd52cb8caf847b38260be8436cbadbb`，branch `main`）。P17-1 完成只读侦察；P17-2 当前正在做最终文档冻结。
 >
-> **本批（P16 全部）尚未做一次整体 commit / push** —— 按协作协议保留所有阶段性修改在工作区，等 P16 整体验收后再一次性 commit。
+> 尚未实现的业务：OCR（扫描件）、修改建议生成（`risk_suggestion`）、前端文档预览。这些均**不在 P17 范围**。
 >
-> 尚未实现的业务：OCR（扫描件）、修改建议生成（`risk_suggestion`）、前端文档预览。这些均**不在 P16 范围**。
+> 全部测试基线（实际运行验证）：
 >
-> 全部测试基线（P16 收尾时点）：Backend **unit 558 + integration 344 = 902 passed**，Agent **unit 906 + Golden Path 15 = 921 passed**，Frontend **181 passed**。
+> * Backend：**unit 558 passed + integration 344 passed = 902 passed**
+> * Agent：**unit 906 passed + integration 150 passed（1 skipped）= 1056 passed, 1 skipped**（其中 Golden Path integration tests = 15，作为子集说明，**不**重复计入 Agent integration 总数）
+> * Frontend：**181 passed**
+>
+> 合计：**2139 passed, 1 skipped**
 
 ### 已知技术债（已接受，不在当时阶段内修复）
 
