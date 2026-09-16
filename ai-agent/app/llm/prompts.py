@@ -34,8 +34,18 @@ from app.llm.findings import ClauseReviewPromptInput
 #: 想复现 v1 的行为，得同时回到当时的 finding 契约（去掉 dimension）。
 PROMPT_CLAUSE_REVIEW_V1 = "clause_review.v1"
 
-#: 当前版本：输出契约里增加了必填的 ``dimension``（P9-8a）。
+#: v2：输出契约里增加了必填的 ``dimension``（P9-8a）。**已停用，但留在仓库里。**
 PROMPT_CLAUSE_REVIEW_V2 = "clause_review.v2"
+
+#: 当前版本：``context_before`` / ``context_after`` 由「必须输出」改为
+#: 「**可选，默认省略**」（P14-3-5）。
+#:
+#: 为什么改：真实 DeepSeek 调用（P14-3-2/3-4）证明模型给出的 context **永远**取自
+#: **相邻的另一个段落**（上一项条款 / 条款标题 / 表格其它行），而定位器要求的是
+#: **同一段落内、紧贴 quote 的字符级前后缀**。实测 6/6 条：提供 context 会把定位
+#: 从 ``CLAUSE_SCOPED`` **降级**为 ``CLAUSE_FALLBACK``，不提供则全部精确命中。
+#: 因此不再要求模型生成它 —— 字段与定位器的支持**都保留**，只是默认留空。
+PROMPT_CLAUSE_REVIEW_V3 = "clause_review.v3"
 
 _PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
 
@@ -89,6 +99,7 @@ def render_clause_review_user_prompt(payload: ClauseReviewPromptInput) -> str:
 __all__ = [
     "PROMPT_CLAUSE_REVIEW_V1",
     "PROMPT_CLAUSE_REVIEW_V2",
+    "PROMPT_CLAUSE_REVIEW_V3",
     "load_prompt",
     "render_clause_review_user_prompt",
 ]

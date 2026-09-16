@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -18,6 +20,7 @@ from app.llm.findings import (
     MatchedRuleHint,
     Suggestion,
 )
+from app.llm.schemas import LLMResult
 
 
 def _finding(**overrides) -> LLMFinding:
@@ -359,6 +362,114 @@ def test_json_schema_is_generated_from_the_model() -> None:
     assert schema["properties"]["context_before"]["maxLength"] == 30, "长度上限必须出现在注入提示的 schema 里"
     assert schema["properties"]["context_after"]["maxLength"] == 30
     assert "paragraph_index" not in schema["properties"]
+
+
+def test_context_is_never_a_required_field() -> None:
+    """``context_before`` / ``context_after`` **不是必填** —— 模型可以完全不输出它们。
+
+    ⚠️ 这一点曾经与 prompt 打架：v2 的硬性规则 3 写着"必须逐字复制，各不超过 30 字"，
+    而 schema 一直允许省略。真实调用（P14-3-2 / P14-3-4，共 6 条可验证样本）证明
+    模型给出的 context **永远**取自相邻的另一个段落（上一项条款 / 条款标题 / 表格其它行），
+    而定位器要的是**同一段落内、紧贴 quote 的字符级前后缀** ——
+    提供它反而把定位从 `CLAUSE_SCOPED` **降级**为 `CLAUSE_FALLBACK`。
+    因此 v3 起 prompt 改为"可选，默认省略"。这条断言把 schema 侧的既成事实钉住。
+    """
+    schema = LLMFinding.model_json_schema()
+
+    assert "context_before" not in schema["required"]
+    assert "context_after" not in schema["required"]
+    assert schema["required"] == [
+        "clause_index",
+        "dimension",
+        "risk_title",
+        "risk_level",
+        "reason",
+        "quote",
+    ]
+
+
+def test_a_finding_without_context_passes_the_real_guard() -> None:
+    """**走真实校验链**（``parse_and_validate``）：原始 JSON 里完全不出现 context，也要通过。
+
+    只断言 ``model_json_schema()['required']`` 是不够的 —— 那条路绕过了
+    JSON 解析与 ``strict=True`` 校验，看不出"模型真的省略了字段"会怎样。
+    """
+    raw = json.dumps(
+        {
+            "findings": [
+                {
+                    "clause_index": 2,
+                    "dimension": "验收",
+                    "risk_title": "验收依据指向未附文件",
+                    "risk_level": "MEDIUM",
+                    "reason": "验收标准以未作为附件的文件为准，我方将失去客观验收依据。",
+                    "quote": "验收标准以双方确认的《需求规格说明书》为准。",
+                }
+            ]
+        },
+        ensure_ascii=False,
+    )
+    result = LLMResult(raw_text=raw, model="deepseek-chat", provider="deepseek")
+
+    validated = json_guard.parse_and_validate(LLMReviewResult, result)
+
+    (finding,) = validated.parsed.findings
+    assert finding.quote == "验收标准以双方确认的《需求规格说明书》为准。"
+    assert finding.context_before == "", "省略即空串 —— 这正是定位器要的『不施加约束』"
+    assert finding.context_after == ""
+
+
+def test_omitting_context_does_not_disturb_the_other_fields() -> None:
+    """省略 context 不影响其余字段的校验 —— 必填的仍然必填，可选的仍然可选。"""
+    raw = json.dumps(
+        {
+            "findings": [
+                {
+                    "clause_index": 0,
+                    "dimension": "知识产权",
+                    "risk_title": "知识产权归属相对方",
+                    "risk_level": "HIGH",
+                    "reason": "成果归属供方。",
+                    "quote": "知识产权归乙方",
+                    "legal_basis": "《民法典》第八百四十七条",
+                    "related_rule_code": "IP_OWNER_SUPPLIER_001",
+                }
+            ]
+        },
+        ensure_ascii=False,
+    )
+    result = LLMResult(raw_text=raw, model="deepseek-chat", provider="deepseek")
+
+    (finding,) = json_guard.parse_and_validate(LLMReviewResult, result).parsed.findings
+
+    assert finding.related_rule_code == "IP_OWNER_SUPPLIER_001"
+    assert finding.legal_basis == "《民法典》第八百四十七条"
+    assert finding.context_before == "" and finding.context_after == ""
+
+
+def test_missing_context_does_not_make_a_required_field_optional() -> None:
+    """反向确认：**该必填的还是必填** —— 省掉 ``quote`` 依然失败。
+
+    防止把"context 可选"误做成"整个 finding 都松了"。
+    """
+    raw = json.dumps(
+        {
+            "findings": [
+                {
+                    "clause_index": 0,
+                    "dimension": "知识产权",
+                    "risk_title": "x",
+                    "risk_level": "HIGH",
+                    "reason": "y",
+                }
+            ]
+        },
+        ensure_ascii=False,
+    )
+    result = LLMResult(raw_text=raw, model="deepseek-chat", provider="deepseek")
+
+    with pytest.raises(json_guard.LLMSchemaInvalidError):
+        json_guard.parse_and_validate(LLMReviewResult, result)
 
 
 def test_injectable_schema_comes_from_the_same_model() -> None:

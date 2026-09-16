@@ -12,7 +12,7 @@ from app.llm.findings import ClauseContext, ClauseReviewPromptInput, MatchedRule
 from app.llm.json_guard import build_schema_instruction
 from app.llm.prompts import (
     PROMPT_CLAUSE_REVIEW_V1,
-    PROMPT_CLAUSE_REVIEW_V2,
+    PROMPT_CLAUSE_REVIEW_V3,
     load_prompt,
     render_clause_review_user_prompt,
 )
@@ -98,14 +98,18 @@ def test_unknown_prompt_version_fails_loudly() -> None:
 # --------------------------------------------------------------------------- #
 # v2：因为输出契约多了 dimension，提示必须升级（P9-8a）
 # --------------------------------------------------------------------------- #
-def test_current_version_is_v2() -> None:
-    """输出契约变了，提示版本必须跟着变 —— 否则"历史任务用的哪版提示"就说不清。"""
+def test_current_version_is_v3() -> None:
+    """输出契约变了，提示版本必须跟着变 —— 否则"历史任务用的哪版提示"就说不清。
+
+    v3 的契约变化：``context_before`` / ``context_after`` 由「必须输出」改为
+    「可选，默认省略」（P14-3-5，依据 P14-3-2/3-4 的真实调用数据）。
+    """
     from app.llm.clause_review import build_clause_review_request
 
     payload = ClauseReviewPromptInput(contract_type="PURCHASE", clauses=CLAUSES)
 
-    assert PROMPT_CLAUSE_REVIEW_V2 == "clause_review.v2"
-    assert build_clause_review_request(payload).prompt_version == "clause_review.v2"
+    assert PROMPT_CLAUSE_REVIEW_V3 == "clause_review.v3"
+    assert build_clause_review_request(payload).prompt_version == "clause_review.v3"
 
 
 def test_v1_is_kept_but_documented_as_incompatible() -> None:
@@ -128,16 +132,16 @@ def test_v1_is_kept_but_documented_as_incompatible() -> None:
         ("不要创造", "必须明令禁止创造集合外的取值"),
     ],
 )
-def test_v2_states_the_dimension_rules(constraint: str, why: str) -> None:
-    assert constraint in load_prompt(PROMPT_CLAUSE_REVIEW_V2), why
+def test_current_prompt_states_the_dimension_rules(constraint: str, why: str) -> None:
+    assert constraint in load_prompt(PROMPT_CLAUSE_REVIEW_V3), why
 
 
-def test_v2_points_at_the_schema_for_the_candidate_set() -> None:
+def test_current_prompt_points_at_the_schema_for_the_candidate_set() -> None:
     """候选集合**不在提示里抄一遍** —— 指向注入的 JSON Schema 的枚举。
 
     抄一份列表就是第二份真相源：schema 改了、抄本没改，而模型会照着错的那份选。
     """
-    text = load_prompt(PROMPT_CLAUSE_REVIEW_V2)
+    text = load_prompt(PROMPT_CLAUSE_REVIEW_V3)
     from app.llm.findings import RiskDimensionLiteral
 
     assert "JSON Schema" in text and "枚举" in text
@@ -150,13 +154,13 @@ def test_v2_points_at_the_schema_for_the_candidate_set() -> None:
         assert len(present) < 3, f"这一行列了 {len(present)} 个候选值，像是把枚举抄进来了：{line}"
 
 
-def test_v2_does_not_hand_the_model_a_near_miss_value() -> None:
+def test_current_prompt_does_not_hand_the_model_a_near_miss_value() -> None:
     """⚠️ 提示里**不许出现"看起来像取值、其实不是"**的词。
 
     写提示时踩过一次：原本的例子写成「例如：知识产权归属、违约责任的轻重」——
     那读起来就是一份可选值清单，模型照着回一个"知识产权归属"，校验直接拒整批。
     """
-    text = load_prompt(PROMPT_CLAUSE_REVIEW_V2)
+    text = load_prompt(PROMPT_CLAUSE_REVIEW_V3)
     from app.llm.findings import RiskDimensionLiteral
 
     for dimension in RiskDimensionLiteral.__args__:
@@ -165,23 +169,23 @@ def test_v2_does_not_hand_the_model_a_near_miss_value() -> None:
         assert f"、{dimension}、" not in text
 
 
-def test_v2_forbids_forcing_a_dimension() -> None:
+def test_current_prompt_forbids_forcing_a_dimension() -> None:
     """必填字段**不构成**「必须报点什么」的压力（P9-8a 架构审查的返工点）。
 
     原先的正文写的是「填不出合适的维度时，选一个语义上最接近的候选值」——
     那是在证据不足时鼓励模型强行归类，与「dimension 不许猜、不许兜底」的口径冲突。
     必填字段的正确逃生口是**不报这条 finding**，而不是硬填一个。
     """
-    text = load_prompt(PROMPT_CLAUSE_REVIEW_V2)
+    text = load_prompt(PROMPT_CLAUSE_REVIEW_V3)
 
     assert "最接近" not in text, "不许再出现「挑一个最接近的」这类措辞"
     assert "不要报这条" in text, "必须给出逃生口：证据支持不了任何候选维度时不报"
     assert "硬填" in text, "要点明：必填 ≠ 可以硬填"
 
 
-def test_v2_binds_the_choice_to_the_evidence() -> None:
+def test_current_prompt_binds_the_choice_to_the_evidence() -> None:
     """选择依据只能是**证据**，不能是关键词、字面相似或条款类型。"""
-    text = load_prompt(PROMPT_CLAUSE_REVIEW_V2)
+    text = load_prompt(PROMPT_CLAUSE_REVIEW_V3)
 
     assert "风险证据本身" in text, "必须把选择依据钉在证据上"
     for excuse in ("字面相似", "条款类型"):
@@ -259,3 +263,65 @@ def test_rendered_prompt_has_no_role_label() -> None:
 
     assert "我方立场" not in text
     assert "【合同类型】PURCHASE" in text
+
+# --------------------------------------------------------------------------- #
+# context：**可选，默认省略**（P14-3-5）
+#
+# 为什么改：真实 DeepSeek 调用（P14-3-2 七条 / P14-3-4 五条，共 6 条可验证样本）证明
+# 模型给出的 context **全部**取自相邻的另一个段落，而定位器要求"同一段落内、紧贴
+# quote 的字符级前后缀"。6/6 条：提供 context 把定位从 CLAUSE_SCOPED **降级**为
+# CLAUSE_FALLBACK；不提供则全部精确命中。因此 prompt 不再要求模型生成它。
+# --------------------------------------------------------------------------- #
+def test_current_prompt_marks_context_as_optional() -> None:
+    """v3 必须明说 context 是**可选**、且**默认不要输出**。"""
+    text = load_prompt(PROMPT_CLAUSE_REVIEW_V3)
+
+    assert "可选字段" in text, "必须点明它是可选字段"
+    assert "默认不要输出" in text, "必须给出默认动作：不输出"
+
+
+def test_current_prompt_no_longer_demands_a_context_length_bound() -> None:
+    """旧契约里"必须逐字复制、各不超过 30 字"这句**必须消失** —— 它要求模型生成 context。"""
+    text = load_prompt(PROMPT_CLAUSE_REVIEW_V3)
+
+    assert "各不超过 30 字" not in text
+    assert "同样必须逐字复制" not in text, "不能再把 context 列进『必须』"
+
+
+def test_current_prompt_states_the_three_conditions_for_providing_context() -> None:
+    """若模型仍要提供，必须同时满足三条 —— 这正是定位器的实际判据。"""
+    text = load_prompt(PROMPT_CLAUSE_REVIEW_V3)
+
+    assert "同一个段落" in text, "条件①：同段"
+    assert "紧贴" in text, "条件②：字符级紧邻"
+    assert "逐字复制" in text, "条件③：逐字"
+
+
+def test_current_prompt_forbids_borrowing_a_neighbouring_paragraph() -> None:
+    """必须点名禁止"引用相邻的另一个段落" —— 这正是实测中模型**每次**都犯的错。"""
+    text = load_prompt(PROMPT_CLAUSE_REVIEW_V3)
+
+    assert "相邻的另一个段落" in text
+    assert "降级" in text, "要说清后果：填错会把定位降级（而不是仅仅『没用』）"
+
+
+def test_current_prompt_says_quote_is_the_primary_evidence() -> None:
+    """``quote`` 是主要定位证据；context 缺失不是失败。"""
+    text = load_prompt(PROMPT_CLAUSE_REVIEW_V3)
+
+    assert "主要证据" in text
+    assert "留空是正确的做法" in text, "必须给出逃生口：没有合格上下文时留空是对的"
+
+
+def test_v2_is_kept_but_no_longer_current() -> None:
+    """v2 **不删**（历史留痕）—— 它记录了"曾经要求模型生成 context"那一版契约。
+
+    与 v1 同一条规矩：覆盖旧文件会让"历史任务当时用的哪版提示"永远查不回来。
+    """
+    from app.llm.prompts import PROMPT_CLAUSE_REVIEW_V2
+
+    v2 = load_prompt(PROMPT_CLAUSE_REVIEW_V2)
+
+    assert v2, "旧版本要留着"
+    assert "各不超过 30 字" in v2, "v2 里那句『必须生成 context』必须原样保留 —— 它是历史证据"
+    assert PROMPT_CLAUSE_REVIEW_V2 != PROMPT_CLAUSE_REVIEW_V3
